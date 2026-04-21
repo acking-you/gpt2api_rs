@@ -1,0 +1,67 @@
+//! Shared domain models used across the service.
+
+use serde::{Deserialize, Serialize};
+
+/// Supported sources for imported ChatGPT access credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AccountSourceKind {
+    /// Raw `access_token` pasted by an operator.
+    Token,
+    /// JSON copied from `https://chatgpt.com/api/auth/session`.
+    SessionJson,
+    /// CPA JSON containing an access token field.
+    CpaJson,
+}
+
+impl AccountSourceKind {
+    /// Returns the stable storage representation used in SQLite rows.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::SessionJson => "session_json",
+            Self::CpaJson => "cpa_json",
+        }
+    }
+}
+
+/// Persisted account state tracked in the control database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountRecord {
+    /// Stable account identifier used by admin APIs and routing.
+    pub name: String,
+    /// Imported ChatGPT access token.
+    pub access_token: String,
+    /// Original import source for the current credential.
+    pub source_kind: AccountSourceKind,
+    /// Known ChatGPT email, if already refreshed.
+    pub email: Option<String>,
+    /// Known upstream user id, if already refreshed.
+    pub user_id: Option<String>,
+    /// Last observed plan type.
+    pub plan_type: Option<String>,
+    /// Last observed default upstream model slug.
+    pub default_model_slug: Option<String>,
+    /// Current local account status.
+    pub status: String,
+    /// Remaining image quota as last observed locally.
+    pub quota_remaining: i64,
+    /// Optional upstream restore timestamp string.
+    pub restore_at: Option<String>,
+    /// Last refresh epoch seconds.
+    pub last_refresh_at: Option<i64>,
+    /// Last successful use epoch seconds.
+    pub last_used_at: Option<i64>,
+    /// Last recorded error summary.
+    pub last_error: Option<String>,
+    /// Count of successful routed requests.
+    pub success_count: i64,
+    /// Count of failed routed requests.
+    pub fail_count: i64,
+    /// Optional account-level concurrency cap.
+    pub request_max_concurrency: Option<u64>,
+    /// Optional account-level minimum start interval in milliseconds.
+    pub request_min_start_interval_ms: Option<u64>,
+    /// Serialized browser impersonation profile JSON.
+    pub browser_profile_json: String,
+}

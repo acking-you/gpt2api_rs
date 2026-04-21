@@ -14,6 +14,8 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 duckdb = { version = "1", features = ["bundled"] }
 parking_lot = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -25,6 +27,7 @@ uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.23"
+wiremock = "0.6"
 
 [lints.rust]
 missing_docs = "deny"

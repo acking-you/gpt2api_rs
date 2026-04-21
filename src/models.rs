@@ -93,3 +93,20 @@ impl AccountRouteCandidate {
         Self { name: name.to_string(), quota_remaining, last_routed_at_ms }
     }
 }
+
+/// Refreshed upstream metadata for one imported account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountMetadata {
+    /// Known ChatGPT email.
+    pub email: Option<String>,
+    /// Known upstream user id.
+    pub user_id: Option<String>,
+    /// Observed plan type if available.
+    pub plan_type: Option<String>,
+    /// Default model slug returned by conversation init.
+    pub default_model_slug: Option<String>,
+    /// Remaining image quota from the latest refresh.
+    pub quota_remaining: i64,
+    /// Reset timestamp string for the image quota window.
+    pub restore_at: Option<String>,
+}

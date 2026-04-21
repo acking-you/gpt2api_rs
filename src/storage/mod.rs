@@ -3,6 +3,7 @@
 pub mod control;
 pub mod events;
 pub mod migrations;
+pub mod outbox;
 
 use anyhow::Result;
 

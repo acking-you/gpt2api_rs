@@ -66,6 +66,77 @@ pub struct AccountRecord {
     pub browser_profile_json: String,
 }
 
+impl AccountRecord {
+    /// Builds a minimal active account record for tests and bootstrap paths.
+    #[must_use]
+    pub fn minimal(name: &str, access_token: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            access_token: access_token.to_string(),
+            source_kind: AccountSourceKind::Token,
+            email: None,
+            user_id: None,
+            plan_type: None,
+            default_model_slug: None,
+            status: "active".to_string(),
+            quota_remaining: 0,
+            restore_at: None,
+            last_refresh_at: None,
+            last_used_at: None,
+            last_error: None,
+            success_count: 0,
+            fail_count: 0,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            browser_profile_json: "{}".to_string(),
+        }
+    }
+}
+
+/// Persisted downstream API-key record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyRecord {
+    /// Stable API key identifier.
+    pub id: String,
+    /// Human-readable key label.
+    pub name: String,
+    /// Stored secret hash for the downstream key.
+    pub secret_hash: String,
+    /// Current key status.
+    pub status: String,
+    /// Maximum billable image quota assigned to the key.
+    pub quota_total_images: i64,
+    /// Already consumed billable images.
+    pub quota_used_images: i64,
+    /// Route strategy string stored in SQLite.
+    pub route_strategy: String,
+    /// Optional bound account-group id.
+    pub account_group_id: Option<String>,
+    /// Optional per-key concurrency cap.
+    pub request_max_concurrency: Option<u64>,
+    /// Optional per-key minimum start interval in milliseconds.
+    pub request_min_start_interval_ms: Option<u64>,
+}
+
+impl ApiKeyRecord {
+    /// Builds a minimal active API-key record for tests.
+    #[must_use]
+    pub fn minimal(id: &str, name: &str, quota_total_images: i64) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            secret_hash: "hash".to_string(),
+            status: "active".to_string(),
+            quota_total_images,
+            quota_used_images: 0,
+            route_strategy: "auto".to_string(),
+            account_group_id: None,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+        }
+    }
+}
+
 /// Route policy used by downstream API keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteStrategy {
@@ -109,4 +180,76 @@ pub struct AccountMetadata {
     pub quota_remaining: i64,
     /// Reset timestamp string for the image quota window.
     pub restore_at: Option<String>,
+}
+
+/// One usage-event summary written to the outbox and later flushed into DuckDB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEventRecord {
+    /// Stable event identifier.
+    pub event_id: String,
+    /// Request-scoped correlation identifier.
+    pub request_id: String,
+    /// Downstream API-key id.
+    pub key_id: String,
+    /// Downstream API-key display name.
+    pub key_name: String,
+    /// Selected upstream account name.
+    pub account_name: String,
+    /// Public endpoint that received the request.
+    pub endpoint: String,
+    /// Requested external model name.
+    pub requested_model: String,
+    /// Resolved upstream model slug.
+    pub resolved_upstream_model: String,
+    /// Requested image count.
+    pub requested_n: i64,
+    /// Generated image count.
+    pub generated_n: i64,
+    /// Billable image count.
+    pub billable_images: i64,
+    /// Final HTTP status code exposed to the caller.
+    pub status_code: i64,
+    /// End-to-end latency in milliseconds.
+    pub latency_ms: i64,
+    /// Optional normalized error code.
+    pub error_code: Option<String>,
+    /// Optional error message summary.
+    pub error_message: Option<String>,
+    /// Optional sidecar detail path reference.
+    pub detail_ref: Option<String>,
+    /// Event creation timestamp.
+    pub created_at: i64,
+}
+
+impl UsageEventRecord {
+    /// Builds a minimal success event used in tests and initial settlement flows.
+    #[must_use]
+    pub fn success(
+        event_id: &str,
+        request_id: &str,
+        key_id: &str,
+        key_name: &str,
+        account_name: &str,
+        billable_images: i64,
+    ) -> Self {
+        Self {
+            event_id: event_id.to_string(),
+            request_id: request_id.to_string(),
+            key_id: key_id.to_string(),
+            key_name: key_name.to_string(),
+            account_name: account_name.to_string(),
+            endpoint: "/v1/images/generations".to_string(),
+            requested_model: "gpt-image-1".to_string(),
+            resolved_upstream_model: "auto".to_string(),
+            requested_n: billable_images,
+            generated_n: billable_images,
+            billable_images,
+            status_code: 200,
+            latency_ms: 0,
+            error_code: None,
+            error_message: None,
+            detail_ref: None,
+            created_at: 0,
+        }
+    }
 }

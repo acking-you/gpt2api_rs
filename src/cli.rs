@@ -59,6 +59,12 @@ pub enum AdminResource {
     /// Account operations.
     #[command(subcommand)]
     Accounts(AdminCommand),
+    /// API key operations.
+    #[command(subcommand)]
+    Keys(KeyCommand),
+    /// Usage-event operations.
+    #[command(subcommand)]
+    Usage(UsageCommand),
 }
 
 /// Account commands.
@@ -66,4 +72,22 @@ pub enum AdminResource {
 pub enum AdminCommand {
     /// List imported accounts.
     List,
+}
+
+/// API key commands.
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// List configured downstream API keys.
+    List,
+}
+
+/// Usage-event commands.
+#[derive(Debug, Subcommand)]
+pub enum UsageCommand {
+    /// List recent usage events.
+    List {
+        /// Maximum number of rows to return.
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
 }

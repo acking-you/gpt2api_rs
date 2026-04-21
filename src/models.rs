@@ -65,3 +65,31 @@ pub struct AccountRecord {
     /// Serialized browser impersonation profile JSON.
     pub browser_profile_json: String,
 }
+
+/// Route policy used by downstream API keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteStrategy {
+    /// Pick the best currently available account from a candidate set.
+    Auto,
+    /// Always route to the first configured candidate.
+    Fixed,
+}
+
+/// Lightweight routing candidate state used during account selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRouteCandidate {
+    /// Candidate account name.
+    pub name: String,
+    /// Remaining local image quota for the account.
+    pub quota_remaining: i64,
+    /// Monotonic last-routed timestamp in milliseconds.
+    pub last_routed_at_ms: i64,
+}
+
+impl AccountRouteCandidate {
+    /// Builds a new routing candidate for tests and selection logic.
+    #[must_use]
+    pub fn new(name: &str, quota_remaining: i64, last_routed_at_ms: i64) -> Self {
+        Self { name: name.to_string(), quota_remaining, last_routed_at_ms }
+    }
+}

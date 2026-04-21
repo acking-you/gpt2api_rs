@@ -42,6 +42,61 @@ impl ControlDb {
         .await?
     }
 
+    /// Lists all imported accounts ordered by account name.
+    pub async fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<AccountRecord>> {
+            let conn = Connection::open(path)?;
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                    name, access_token, source_kind, email, user_id, plan_type,
+                    default_model_slug, status, quota_remaining, restore_at,
+                    last_refresh_at, last_used_at, last_error, success_count, fail_count,
+                    request_max_concurrency, request_min_start_interval_ms, browser_profile_json
+                FROM accounts
+                ORDER BY name ASC
+                "#,
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let source_kind = match row.get::<_, String>(2)?.as_str() {
+                    "token" => crate::models::AccountSourceKind::Token,
+                    "session_json" => crate::models::AccountSourceKind::SessionJson,
+                    "cpa_json" => crate::models::AccountSourceKind::CpaJson,
+                    other => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            format!("unknown source kind: {other}").into(),
+                        ))
+                    }
+                };
+                Ok(AccountRecord {
+                    name: row.get(0)?,
+                    access_token: row.get(1)?,
+                    source_kind,
+                    email: row.get(3)?,
+                    user_id: row.get(4)?,
+                    plan_type: row.get(5)?,
+                    default_model_slug: row.get(6)?,
+                    status: row.get(7)?,
+                    quota_remaining: row.get(8)?,
+                    restore_at: row.get(9)?,
+                    last_refresh_at: row.get(10)?,
+                    last_used_at: row.get(11)?,
+                    last_error: row.get(12)?,
+                    success_count: row.get(13)?,
+                    fail_count: row.get(14)?,
+                    request_max_concurrency: row.get(15)?,
+                    request_min_start_interval_ms: row.get(16)?,
+                    browser_profile_json: row.get(17)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
     /// Inserts or updates an imported account in the control-plane database.
     pub async fn upsert_account(&self, account: &AccountRecord) -> Result<()> {
         let path = self.path.clone();
@@ -160,6 +215,33 @@ impl ControlDb {
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(err) => Err(err.into()),
             }
+        })
+        .await?
+    }
+
+    /// Lists all configured downstream API keys ordered by id.
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ApiKeyRecord>> {
+            let conn = Connection::open(path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, secret_hash, status, quota_total_images, quota_used_images, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(ApiKeyRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    secret_hash: row.get(2)?,
+                    status: row.get(3)?,
+                    quota_total_images: row.get(4)?,
+                    quota_used_images: row.get(5)?,
+                    route_strategy: row.get(6)?,
+                    account_group_id: row.get(7)?,
+                    request_max_concurrency: row.get(8)?,
+                    request_min_start_interval_ms: row.get(9)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
         .await?
     }

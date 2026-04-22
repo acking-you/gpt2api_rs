@@ -2,9 +2,15 @@
 
 use std::sync::Arc;
 
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
-use crate::{http::{admin_api, health::healthz, public_api}, service::AppService};
+use crate::{
+    http::{admin_api, health::healthz, public_api},
+    service::AppService,
+};
 
 /// Builds the application router for a fully initialized runtime service.
 pub fn build_router(service: Arc<AppService>) -> Router {

@@ -37,10 +37,15 @@ async fn main() -> Result<()> {
 }
 
 /// Bootstraps local storage and constructs the runtime router.
-async fn build_runtime_router(command: &ServeCommand) -> Result<(axum::Router, watch::Sender<bool>)> {
+async fn build_runtime_router(
+    command: &ServeCommand,
+) -> Result<(axum::Router, watch::Sender<bool>)> {
     let paths = ResolvedPaths::new(command.storage_dir.clone());
     let storage = Storage::open(&paths).await?;
-    let service = Arc::new(AppService::new(storage, command.admin_token.clone(), ChatgptUpstreamClient::default()).await?);
+    let service = Arc::new(
+        AppService::new(storage, command.admin_token.clone(), ChatgptUpstreamClient::default())
+            .await?,
+    );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     std::mem::drop(Arc::clone(&service).spawn_limited_account_refresher(shutdown_rx.clone()));
     std::mem::drop(Arc::clone(&service).spawn_outbox_flusher(shutdown_rx));

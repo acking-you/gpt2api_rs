@@ -7,10 +7,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use gpt2api_rs::{
-    app::build_router,
-    config::ResolvedPaths,
-    service::AppService,
-    storage::Storage,
+    app::build_router, config::ResolvedPaths, service::AppService, storage::Storage,
     upstream::chatgpt::ChatgptUpstreamClient,
 };
 use tempfile::TempDir;
@@ -21,9 +18,13 @@ async fn build_test_app() -> (TempDir, axum::Router) {
     let paths = ResolvedPaths::new(temp.path().to_path_buf());
     let storage = Storage::open(&paths).await.expect("storage opens");
     let service = Arc::new(
-        AppService::new(storage, "secret".to_string(), ChatgptUpstreamClient::new("http://127.0.0.1:9", None))
-            .await
-            .expect("service init"),
+        AppService::new(
+            storage,
+            "secret".to_string(),
+            ChatgptUpstreamClient::new("http://127.0.0.1:9", None),
+        )
+        .await
+        .expect("service init"),
     );
     (temp, build_router(service))
 }

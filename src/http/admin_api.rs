@@ -85,12 +85,8 @@ pub async fn status(
 ) -> Result<Json<Value>, AppError> {
     require_admin(&headers, &service)?;
     let accounts = service.storage().control.list_accounts().await.map_err(AppError::internal)?;
-    let outbox_backlog = service
-        .storage()
-        .control
-        .list_pending_outbox()
-        .await
-        .map_err(AppError::internal)?;
+    let outbox_backlog =
+        service.storage().control.list_pending_outbox().await.map_err(AppError::internal)?;
     let accounts_active = accounts.iter().filter(|record| record.status == "active").count();
     let accounts_limited = accounts.iter().filter(|record| record.status == "limited").count();
     let accounts_invalid = accounts.iter().filter(|record| record.status == "invalid").count();
@@ -121,7 +117,12 @@ pub async fn import_accounts(
 ) -> Result<Json<Value>, AppError> {
     require_admin(&headers, &service)?;
     let mut items = Vec::new();
-    for token in body.access_tokens.into_iter().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    for token in body
+        .access_tokens
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         items.push(AccountImportItem::AccessToken(token));
     }
     for session_json in body
@@ -136,7 +137,8 @@ pub async fn import_accounts(
         return Err(AppError::bad_request("access_tokens or session_jsons is required"));
     }
     let imported = service.import_accounts(&items).await.map_err(AppError::internal)?;
-    let access_tokens: Vec<String> = imported.iter().map(|account| account.access_token.clone()).collect();
+    let access_tokens: Vec<String> =
+        imported.iter().map(|account| account.access_token.clone()).collect();
     let refreshed = service.refresh_accounts(&access_tokens).await.map_err(AppError::internal)?;
     Ok(Json(json!({ "items": refreshed })))
 }
@@ -180,7 +182,10 @@ pub async fn update_account(
     if access_token.is_empty() {
         return Err(AppError::bad_request("access_token is required"));
     }
-    let browser_profile = if body.session_token.is_some() || body.user_agent.is_some() || body.impersonate_browser.is_some() {
+    let browser_profile = if body.session_token.is_some()
+        || body.user_agent.is_some()
+        || body.impersonate_browser.is_some()
+    {
         Some(BrowserProfile {
             session_token: body.session_token,
             user_agent: body.user_agent,
@@ -202,7 +207,9 @@ pub async fn update_account(
         request_max_concurrency: body.request_max_concurrency,
         request_min_start_interval_ms: body.request_min_start_interval_ms,
     };
-    let Some(account) = service.update_account(access_token, &update).await.map_err(AppError::internal)? else {
+    let Some(account) =
+        service.update_account(access_token, &update).await.map_err(AppError::internal)?
+    else {
         return Err(AppError::not_found("account not found"));
     };
     Ok(Json(json!({ "item": account })))

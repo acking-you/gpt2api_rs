@@ -7,10 +7,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use gpt2api_rs::{
-    app::build_router,
-    config::ResolvedPaths,
-    service::AppService,
-    storage::Storage,
+    app::build_router, config::ResolvedPaths, service::AppService, storage::Storage,
     upstream::chatgpt::ChatgptUpstreamClient,
 };
 use serde_json::Value;

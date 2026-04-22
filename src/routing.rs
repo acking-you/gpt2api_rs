@@ -9,15 +9,12 @@ pub fn select_best_candidate(
     candidates: &[AccountRouteCandidate],
 ) -> Option<AccountRouteCandidate> {
     match strategy {
-        RouteStrategy::Auto => {
-            candidates.iter().filter(|candidate| candidate.quota_remaining > 0).cloned().max_by(
-                |left, right| {
-                    left.quota_remaining
-                        .cmp(&right.quota_remaining)
-                        .then_with(|| right.last_routed_at_ms.cmp(&left.last_routed_at_ms))
-                },
-            )
-        }
+        RouteStrategy::Auto => candidates.iter().cloned().max_by(|left, right| {
+            left.quota_known
+                .cmp(&right.quota_known)
+                .then_with(|| left.quota_remaining.cmp(&right.quota_remaining))
+                .then_with(|| right.last_routed_at_ms.cmp(&left.last_routed_at_ms))
+        }),
         RouteStrategy::Fixed => candidates.first().cloned(),
     }
 }

@@ -18,6 +18,7 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             default_model_slug TEXT,
             status TEXT NOT NULL,
             quota_remaining INTEGER NOT NULL DEFAULT 0,
+            quota_known INTEGER NOT NULL DEFAULT 0,
             restore_at TEXT,
             last_refresh_at INTEGER,
             last_used_at INTEGER,
@@ -73,6 +74,11 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_account_column(
+        conn,
+        "quota_known",
+        "ALTER TABLE accounts ADD COLUMN quota_known INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -101,5 +107,16 @@ pub fn bootstrap_event_schema(conn: &DuckConnection) -> Result<()> {
         );
         "#,
     )?;
+    Ok(())
+}
+
+fn ensure_account_column(conn: &SqliteConnection, column_name: &str, ddl: &str) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(accounts)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let columns = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if columns.iter().any(|column| column == column_name) {
+        return Ok(());
+    }
+    conn.execute_batch(ddl)?;
     Ok(())
 }

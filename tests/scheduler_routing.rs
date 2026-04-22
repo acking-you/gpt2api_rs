@@ -28,12 +28,38 @@ fn auto_route_prefers_higher_remaining_quota_then_least_recently_used() {
     let selected = select_best_candidate(
         RouteStrategy::Auto,
         &[
-            AccountRouteCandidate::new("a1", 3, 200),
-            AccountRouteCandidate::new("a2", 8, 300),
-            AccountRouteCandidate::new("a3", 8, 100),
+            AccountRouteCandidate::new("a1", 3, true, 200),
+            AccountRouteCandidate::new("a2", 8, true, 300),
+            AccountRouteCandidate::new("a3", 8, true, 100),
         ],
     )
     .expect("selected candidate");
 
     assert_eq!(selected.name, "a3");
+}
+
+/// Keeps accounts with unknown quota eligible when the upstream no longer exposes image limits.
+#[test]
+fn auto_route_keeps_unknown_quota_accounts_eligible() {
+    let selected = select_best_candidate(
+        RouteStrategy::Auto,
+        &[
+            AccountRouteCandidate::new("known", 4, true, 300),
+            AccountRouteCandidate::new("unknown", 0, false, 100),
+        ],
+    )
+    .expect("selected candidate");
+
+    assert_eq!(selected.name, "known");
+
+    let unknown_only = select_best_candidate(
+        RouteStrategy::Auto,
+        &[
+            AccountRouteCandidate::new("u1", 0, false, 200),
+            AccountRouteCandidate::new("u2", 0, false, 100),
+        ],
+    )
+    .expect("selected candidate");
+
+    assert_eq!(unknown_only.name, "u2");
 }

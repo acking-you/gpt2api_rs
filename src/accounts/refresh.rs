@@ -1,6 +1,6 @@
 //! Upstream metadata refresh for imported accounts.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -36,15 +36,11 @@ pub async fn fetch_account_metadata(
         .json()
         .await?;
 
-    let image_limit = init
-        .get("limits_progress")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("feature_name").and_then(Value::as_str) == Some("image_gen"))
-        })
-        .ok_or_else(|| anyhow!("missing image_gen limits_progress entry"))?;
+    let image_limit = init.get("limits_progress").and_then(Value::as_array).and_then(|items| {
+        items
+            .iter()
+            .find(|item| item.get("feature_name").and_then(Value::as_str) == Some("image_gen"))
+    });
 
     Ok(AccountMetadata {
         email: me.get("email").and_then(Value::as_str).map(ToString::to_string),
@@ -54,7 +50,14 @@ pub async fn fetch_account_metadata(
             .get("default_model_slug")
             .and_then(Value::as_str)
             .map(ToString::to_string),
-        quota_remaining: image_limit.get("remaining").and_then(Value::as_i64).unwrap_or(0),
-        restore_at: image_limit.get("reset_after").and_then(Value::as_str).map(ToString::to_string),
+        quota_remaining: image_limit
+            .and_then(|item| item.get("remaining"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        quota_known: image_limit.is_some(),
+        restore_at: image_limit
+            .and_then(|item| item.get("reset_after"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
     })
 }

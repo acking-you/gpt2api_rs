@@ -4,24 +4,32 @@ use anyhow::Result;
 use clap::Parser;
 use gpt2api_rs::{
     admin_client,
-    app::build_router_with_state,
+    app::build_router,
     cli::{
         AdminCommand, AdminResource, AdminRootCommand, Cli, Command, KeyCommand, ServeCommand,
         UsageCommand,
     },
     config::ResolvedPaths,
-    http::admin_api::AdminState,
+    service::AppService,
     storage::Storage,
+    upstream::chatgpt::ChatgptUpstreamClient,
 };
+use std::sync::Arc;
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(command) => {
-            let router = build_runtime_router(&command).await?;
+            let (router, shutdown_tx) = build_runtime_router(&command).await?;
             let listener = tokio::net::TcpListener::bind(&command.listen).await?;
-            axum::serve(listener, router).await?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    let _ = shutdown_tx.send(true);
+                })
+                .await?;
             Ok(())
         }
         Command::Admin(command) => run_admin_command(command).await,
@@ -29,12 +37,14 @@ async fn main() -> Result<()> {
 }
 
 /// Bootstraps local storage and constructs the runtime router.
-async fn build_runtime_router(command: &ServeCommand) -> Result<axum::Router> {
+async fn build_runtime_router(command: &ServeCommand) -> Result<(axum::Router, watch::Sender<bool>)> {
     let paths = ResolvedPaths::new(command.storage_dir.clone());
     let storage = Storage::open(&paths).await?;
-    let admin_state =
-        AdminState { admin_token: command.admin_token.clone(), storage: Some(storage) };
-    Ok(build_router_with_state(admin_state))
+    let service = Arc::new(AppService::new(storage, command.admin_token.clone(), ChatgptUpstreamClient::default()).await?);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    std::mem::drop(Arc::clone(&service).spawn_limited_account_refresher(shutdown_rx.clone()));
+    std::mem::drop(Arc::clone(&service).spawn_outbox_flusher(shutdown_rx));
+    Ok((build_router(service), shutdown_tx))
 }
 
 async fn run_admin_command(command: AdminRootCommand) -> Result<()> {

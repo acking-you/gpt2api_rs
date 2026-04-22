@@ -75,4 +75,54 @@ impl EventStore {
         })
         .await?
     }
+
+    /// Inserts one batch of usage-event summaries into DuckDB.
+    pub async fn insert_usage_events(&self, events: &[UsageEventRecord]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let events = events.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    r#"
+                    INSERT INTO usage_events (
+                        event_id, request_id, key_id, key_name, account_name, endpoint,
+                        requested_model, resolved_upstream_model, requested_n, generated_n,
+                        billable_images, status_code, latency_ms, error_code, error_message,
+                        detail_ref, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    "#,
+                )?;
+                for event in &events {
+                    stmt.execute(duckdb::params![
+                        &event.event_id,
+                        &event.request_id,
+                        &event.key_id,
+                        &event.key_name,
+                        &event.account_name,
+                        &event.endpoint,
+                        &event.requested_model,
+                        &event.resolved_upstream_model,
+                        event.requested_n,
+                        event.generated_n,
+                        event.billable_images,
+                        event.status_code,
+                        event.latency_ms,
+                        &event.error_code,
+                        &event.error_message,
+                        &event.detail_ref,
+                        event.created_at,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
 }

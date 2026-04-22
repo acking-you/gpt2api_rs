@@ -1,32 +1,28 @@
 //! Router construction and app bootstrap.
 
-use axum::{routing::get, Router};
+use std::sync::Arc;
 
-use crate::http::{
-    admin_api::{list_accounts, list_keys, list_usage, status, AdminState},
-    health::healthz,
-    public_api::list_models,
-};
+use axum::{routing::{get, post}, Router};
 
-/// Builds the application router with the provided admin bearer token.
-pub fn build_router(admin_token: String) -> Router {
-    let admin_state = AdminState { admin_token, storage: None };
-    build_router_with_state(admin_state)
-}
+use crate::{http::{admin_api, health::healthz, public_api}, service::AppService};
 
-/// Builds the application router for a fully initialized runtime state.
-pub fn build_router_with_state(admin_state: AdminState) -> Router {
+/// Builds the application router for a fully initialized runtime service.
+pub fn build_router(service: Arc<AppService>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/models", get(list_models))
-        .route("/admin/status", get(status))
-        .route("/admin/accounts", get(list_accounts))
-        .route("/admin/keys", get(list_keys))
-        .route("/admin/usage", get(list_usage))
-        .with_state(admin_state)
-}
-
-/// Builds the application router used by integration tests and the initial binary.
-pub fn build_router_for_tests() -> Router {
-    build_router("secret".to_string())
+        .route("/version", get(public_api::version))
+        .route("/auth/login", post(public_api::login))
+        .route("/v1/models", get(public_api::list_models))
+        .route("/v1/images/generations", post(public_api::generate_images))
+        .route("/v1/images/edits", post(public_api::edit_images))
+        .route("/v1/chat/completions", post(public_api::create_chat_completion))
+        .route("/v1/responses", post(public_api::create_response))
+        .route("/admin/status", get(admin_api::status))
+        .route("/admin/accounts", get(admin_api::list_accounts).delete(admin_api::delete_accounts))
+        .route("/admin/accounts/import", post(admin_api::import_accounts))
+        .route("/admin/accounts/refresh", post(admin_api::refresh_accounts))
+        .route("/admin/accounts/update", post(admin_api::update_account))
+        .route("/admin/keys", get(admin_api::list_keys))
+        .route("/admin/usage", get(admin_api::list_usage))
+        .with_state(service)
 }

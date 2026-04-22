@@ -46,6 +46,8 @@ pub struct AccountRecord {
     pub status: String,
     /// Remaining image quota as last observed locally.
     pub quota_remaining: i64,
+    /// Whether the upstream currently exposes an explicit remaining image quota.
+    pub quota_known: bool,
     /// Optional upstream restore timestamp string.
     pub restore_at: Option<String>,
     /// Last refresh epoch seconds.
@@ -66,6 +68,25 @@ pub struct AccountRecord {
     pub browser_profile_json: String,
 }
 
+/// Persisted browser/session hints used for upstream ChatGPT Web calls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserProfile {
+    /// Optional ChatGPT web session cookie value.
+    pub session_token: Option<String>,
+    /// Optional preferred user agent.
+    pub user_agent: Option<String>,
+    /// Optional impersonated browser family such as `edge` or `chrome`.
+    pub impersonate_browser: Option<String>,
+    /// Optional persisted OpenAI device id.
+    pub oai_device_id: Option<String>,
+    /// Optional client hint header.
+    pub sec_ch_ua: Option<String>,
+    /// Optional mobile client hint header.
+    pub sec_ch_ua_mobile: Option<String>,
+    /// Optional platform client hint header.
+    pub sec_ch_ua_platform: Option<String>,
+}
+
 impl AccountRecord {
     /// Builds a minimal active account record for tests and bootstrap paths.
     #[must_use]
@@ -80,6 +101,7 @@ impl AccountRecord {
             default_model_slug: None,
             status: "active".to_string(),
             quota_remaining: 0,
+            quota_known: false,
             restore_at: None,
             last_refresh_at: None,
             last_used_at: None,
@@ -90,6 +112,12 @@ impl AccountRecord {
             request_min_start_interval_ms: None,
             browser_profile_json: "{}".to_string(),
         }
+    }
+
+    /// Deserializes the persisted browser profile JSON, returning defaults on invalid data.
+    #[must_use]
+    pub fn browser_profile(&self) -> BrowserProfile {
+        serde_json::from_str(&self.browser_profile_json).unwrap_or_default()
     }
 }
 
@@ -153,6 +181,8 @@ pub struct AccountRouteCandidate {
     pub name: String,
     /// Remaining local image quota for the account.
     pub quota_remaining: i64,
+    /// Whether the remaining quota is explicitly known.
+    pub quota_known: bool,
     /// Monotonic last-routed timestamp in milliseconds.
     pub last_routed_at_ms: i64,
 }
@@ -160,8 +190,13 @@ pub struct AccountRouteCandidate {
 impl AccountRouteCandidate {
     /// Builds a new routing candidate for tests and selection logic.
     #[must_use]
-    pub fn new(name: &str, quota_remaining: i64, last_routed_at_ms: i64) -> Self {
-        Self { name: name.to_string(), quota_remaining, last_routed_at_ms }
+    pub fn new(
+        name: &str,
+        quota_remaining: i64,
+        quota_known: bool,
+        last_routed_at_ms: i64,
+    ) -> Self {
+        Self { name: name.to_string(), quota_remaining, quota_known, last_routed_at_ms }
     }
 }
 
@@ -178,6 +213,8 @@ pub struct AccountMetadata {
     pub default_model_slug: Option<String>,
     /// Remaining image quota from the latest refresh.
     pub quota_remaining: i64,
+    /// Whether the upstream explicitly exposed the remaining image quota.
+    pub quota_known: bool,
     /// Reset timestamp string for the image quota window.
     pub restore_at: Option<String>,
 }

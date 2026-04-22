@@ -51,6 +51,7 @@ async fn upsert_account_persists_imported_account() {
         default_model_slug: Some("auto".to_string()),
         status: "active".to_string(),
         quota_remaining: 12,
+        quota_known: true,
         restore_at: None,
         last_refresh_at: Some(123),
         last_used_at: None,

@@ -12,10 +12,10 @@ use serde_json::{json, Value};
 
 use crate::{
     error::AppError,
-    models::{AccountRecord, ApiKeyRecord, BrowserProfile, UsageEventRecord},
+    models::{ApiKeyRecord, BrowserProfile, ProxyConfigRecord, UsageEventRecord},
     service::{
-        AccountImportItem, AccountUpdate, ApiKeyCreate, ApiKeySecretRecord, ApiKeyUpdate,
-        AppService,
+        AccountImportItem, AccountUpdate, AdminAccountView, ApiKeyCreate, ApiKeySecretRecord,
+        ApiKeyUpdate, AppService, ProxyConfigCreate, ProxyConfigUpdate,
     },
 };
 
@@ -79,6 +79,50 @@ pub struct UpdateAccountRequest {
     request_max_concurrency: Option<u64>,
     /// Optional replacement account-level minimum start interval.
     request_min_start_interval_ms: Option<u64>,
+    /// Optional replacement proxy mode.
+    #[serde(default)]
+    proxy_mode: Option<String>,
+    /// Optional replacement bound proxy config id. `null` clears the field.
+    #[serde(default)]
+    proxy_config_id: Option<Option<String>>,
+}
+
+/// Request body for creating one reusable proxy config.
+#[derive(Debug, Deserialize)]
+pub struct CreateProxyConfigRequest {
+    /// Human-readable proxy-config label.
+    name: String,
+    /// Proxy URL including scheme and host.
+    proxy_url: String,
+    /// Optional proxy username.
+    #[serde(default)]
+    proxy_username: Option<String>,
+    /// Optional proxy password.
+    #[serde(default)]
+    proxy_password: Option<String>,
+    /// Optional replacement status. Defaults to `active`.
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Request body for updating one reusable proxy config.
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateProxyConfigRequest {
+    /// Optional replacement label.
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional replacement proxy URL.
+    #[serde(default)]
+    proxy_url: Option<String>,
+    /// Optional replacement proxy username. `null` clears the field.
+    #[serde(default)]
+    proxy_username: Option<Option<String>>,
+    /// Optional replacement proxy password. `null` clears the field.
+    #[serde(default)]
+    proxy_password: Option<Option<String>>,
+    /// Optional replacement status.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 /// Request body for creating one downstream API key.
@@ -156,9 +200,9 @@ pub async fn status(
 pub async fn list_accounts(
     State(service): State<Arc<AppService>>,
     headers: HeaderMap,
-) -> Result<Json<Vec<AccountRecord>>, AppError> {
+) -> Result<Json<Vec<AdminAccountView>>, AppError> {
     require_admin(&headers, &service)?;
-    let accounts = service.storage().control.list_accounts().await.map_err(AppError::internal)?;
+    let accounts = service.list_admin_accounts().await.map_err(AppError::internal)?;
     Ok(Json(accounts))
 }
 
@@ -259,13 +303,111 @@ pub async fn update_account(
         browser_profile,
         request_max_concurrency: body.request_max_concurrency,
         request_min_start_interval_ms: body.request_min_start_interval_ms,
+        proxy_mode: body.proxy_mode,
+        proxy_config_id: body.proxy_config_id,
     };
     let Some(account) =
         service.update_account(access_token, &update).await.map_err(AppError::internal)?
     else {
         return Err(AppError::not_found("account not found"));
     };
-    Ok(Json(json!({ "item": account })))
+    let item = service
+        .list_admin_accounts()
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .find(|item| item.account.name == account.name)
+        .ok_or_else(|| AppError::internal("updated account disappeared"))?;
+    Ok(Json(json!({ "item": item })))
+}
+
+/// Lists reusable proxy configs.
+pub async fn list_proxy_configs(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProxyConfigRecord>>, AppError> {
+    require_admin(&headers, &service)?;
+    Ok(Json(service.list_proxy_configs().await.map_err(AppError::internal)?))
+}
+
+/// Creates one reusable proxy config.
+pub async fn create_proxy_config(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateProxyConfigRequest>,
+) -> Result<Json<ProxyConfigRecord>, AppError> {
+    require_admin(&headers, &service)?;
+    let record = service
+        .create_proxy_config(&ProxyConfigCreate {
+            name: body.name,
+            proxy_url: body.proxy_url,
+            proxy_username: body.proxy_username,
+            proxy_password: body.proxy_password,
+            status: body.status,
+        })
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(record))
+}
+
+/// Updates one reusable proxy config.
+pub async fn update_proxy_config(
+    Path(proxy_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateProxyConfigRequest>,
+) -> Result<Json<ProxyConfigRecord>, AppError> {
+    require_admin(&headers, &service)?;
+    let Some(record) = service
+        .update_proxy_config(
+            &proxy_id,
+            &ProxyConfigUpdate {
+                name: body.name,
+                proxy_url: body.proxy_url,
+                proxy_username: body.proxy_username,
+                proxy_password: body.proxy_password,
+                status: body.status,
+            },
+        )
+        .await
+        .map_err(AppError::internal)?
+    else {
+        return Err(AppError::not_found("proxy config not found"));
+    };
+    Ok(Json(record))
+}
+
+/// Deletes one reusable proxy config.
+pub async fn delete_proxy_config(
+    Path(proxy_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    let deleted = service.delete_proxy_config(&proxy_id).await.map_err(|error| {
+        let message = error.to_string();
+        if message.contains("still bound") {
+            AppError::conflict(message)
+        } else {
+            AppError::internal(error)
+        }
+    })?;
+    Ok(Json(json!({ "deleted": deleted, "id": proxy_id })))
+}
+
+/// Checks one reusable proxy config against the configured upstream.
+pub async fn check_proxy_config(
+    Path(proxy_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    let result = service.check_proxy_config(&proxy_id).await.map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "ok": result.ok,
+        "message": result.message,
+        "status_code": result.status_code,
+    })))
 }
 
 /// Lists configured downstream API keys.

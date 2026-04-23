@@ -25,6 +25,42 @@ impl AccountSourceKind {
     }
 }
 
+/// Account-level upstream proxy selection mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountProxyMode {
+    /// Reuse the service-wide default upstream proxy.
+    #[default]
+    Inherit,
+    /// Force the account to connect without any proxy.
+    Direct,
+    /// Force the account to use one stored proxy config.
+    Fixed,
+}
+
+impl AccountProxyMode {
+    /// Returns the stable storage representation used in SQLite rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Direct => "direct",
+            Self::Fixed => "fixed",
+        }
+    }
+
+    /// Parses one stable storage string into an account proxy mode.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "inherit" => Some(Self::Inherit),
+            "direct" => Some(Self::Direct),
+            "fixed" => Some(Self::Fixed),
+            _ => None,
+        }
+    }
+}
+
 /// Persisted account state tracked in the control database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountRecord {
@@ -64,6 +100,10 @@ pub struct AccountRecord {
     pub request_max_concurrency: Option<u64>,
     /// Optional account-level minimum start interval in milliseconds.
     pub request_min_start_interval_ms: Option<u64>,
+    /// Account-level upstream proxy selection mode.
+    pub proxy_mode: AccountProxyMode,
+    /// Optional bound proxy config id when `proxy_mode = fixed`.
+    pub proxy_config_id: Option<String>,
     /// Serialized browser impersonation profile JSON.
     pub browser_profile_json: String,
 }
@@ -110,6 +150,8 @@ impl AccountRecord {
             fail_count: 0,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            proxy_mode: AccountProxyMode::Inherit,
+            proxy_config_id: None,
             browser_profile_json: "{}".to_string(),
         }
     }
@@ -119,6 +161,27 @@ impl AccountRecord {
     pub fn browser_profile(&self) -> BrowserProfile {
         serde_json::from_str(&self.browser_profile_json).unwrap_or_default()
     }
+}
+
+/// Persisted reusable upstream proxy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyConfigRecord {
+    /// Stable proxy config identifier.
+    pub id: String,
+    /// Human-readable proxy config label.
+    pub name: String,
+    /// Proxy URL including scheme and host.
+    pub proxy_url: String,
+    /// Optional proxy username.
+    pub proxy_username: Option<String>,
+    /// Optional proxy password.
+    pub proxy_password: Option<String>,
+    /// Current proxy config status.
+    pub status: String,
+    /// Creation time as unix epoch seconds.
+    pub created_at: i64,
+    /// Last update time as unix epoch seconds.
+    pub updated_at: i64,
 }
 
 /// Persisted downstream API-key record.

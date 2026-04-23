@@ -52,6 +52,12 @@ impl AppError {
         Self::with_status(StatusCode::NOT_FOUND, message)
     }
 
+    /// Creates a `409 Conflict` error.
+    #[must_use]
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::with_status(StatusCode::CONFLICT, message)
+    }
+
     /// Creates a `500 Internal Server Error` error.
     #[must_use]
     pub fn internal(error: impl std::fmt::Display) -> Self {

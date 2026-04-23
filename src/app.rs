@@ -28,6 +28,15 @@ pub fn build_router(service: Arc<AppService>) -> Router {
         .route("/admin/accounts/import", post(admin_api::import_accounts))
         .route("/admin/accounts/refresh", post(admin_api::refresh_accounts))
         .route("/admin/accounts/update", post(admin_api::update_account))
+        .route(
+            "/admin/proxy-configs",
+            get(admin_api::list_proxy_configs).post(admin_api::create_proxy_config),
+        )
+        .route(
+            "/admin/proxy-configs/:proxy_id",
+            patch(admin_api::update_proxy_config).delete(admin_api::delete_proxy_config),
+        )
+        .route("/admin/proxy-configs/:proxy_id/check", post(admin_api::check_proxy_config))
         .route("/admin/keys", get(admin_api::list_keys).post(admin_api::create_key))
         .route("/admin/keys/:key_id", patch(admin_api::update_key).delete(admin_api::delete_key))
         .route("/admin/keys/:key_id/rotate", post(admin_api::rotate_key))

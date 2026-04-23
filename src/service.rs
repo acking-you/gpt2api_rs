@@ -1,12 +1,13 @@
 //! Service orchestration layer.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -15,18 +16,22 @@ use uuid::Uuid;
 
 use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
-    models::{AccountRecord, ApiKeyRecord, BrowserProfile, UsageEventRecord},
+    models::{
+        AccountMetadata, AccountRecord, ApiKeyRecord, BrowserProfile, ProxyConfigRecord,
+        UsageEventRecord,
+    },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
     storage::Storage,
     upstream::chatgpt::{
-        is_token_invalid_error, ChatgptImageResult, ChatgptTextResult, ChatgptTextStream,
-        ChatgptUpstreamClient,
+        access_token_expires_at, is_token_invalid_error, ChatgptImageResult, ChatgptTextResult,
+        ChatgptTextStream, ChatgptUpstreamClient,
     },
 };
 
 const DEFAULT_KEY_ID: &str = "default";
 const DEFAULT_REFRESH_SECONDS: u64 = 300;
+const ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS: i64 = 300;
 const DEFAULT_OUTBOX_FLUSH_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_OUTBOX_FLUSH_BATCH_SIZE: u64 = 100;
 
@@ -56,6 +61,82 @@ pub struct AccountUpdate {
     pub request_max_concurrency: Option<u64>,
     /// Replacement account-level minimum start interval.
     pub request_min_start_interval_ms: Option<u64>,
+    /// Optional replacement account-level proxy mode.
+    pub proxy_mode: Option<String>,
+    /// Optional replacement bound proxy config id. `Some(None)` clears the field.
+    pub proxy_config_id: Option<Option<String>>,
+}
+
+/// Effective upstream proxy settings resolved for one account request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedAccountProxy {
+    /// Source label used for admin visibility and debugging.
+    pub source: &'static str,
+    /// Effective proxy URL, or `None` for direct connections.
+    pub proxy_url: Option<String>,
+    /// Optional proxy username.
+    pub proxy_username: Option<String>,
+    /// Optional proxy password.
+    pub proxy_password: Option<String>,
+    /// Optional bound proxy config id.
+    pub proxy_config_id: Option<String>,
+    /// Optional bound proxy config name.
+    pub proxy_config_name: Option<String>,
+}
+
+/// One admin-visible account row including effective proxy resolution.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminAccountView {
+    /// Flattened persisted account state.
+    #[serde(flatten)]
+    pub account: AccountRecord,
+    /// Effective proxy source label.
+    pub effective_proxy_source: String,
+    /// Effective proxy URL, if one is used.
+    pub effective_proxy_url: Option<String>,
+    /// Effective proxy config name, when bound.
+    pub effective_proxy_config_name: Option<String>,
+}
+
+/// Mutable proxy-config fields allowed through the admin create surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyConfigCreate {
+    /// Human-readable proxy config label.
+    pub name: String,
+    /// Proxy URL including scheme and host.
+    pub proxy_url: String,
+    /// Optional proxy username.
+    pub proxy_username: Option<String>,
+    /// Optional proxy password.
+    pub proxy_password: Option<String>,
+    /// Optional replacement status. Defaults to `active`.
+    pub status: Option<String>,
+}
+
+/// Mutable proxy-config fields allowed through the admin update surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyConfigUpdate {
+    /// Optional replacement proxy-config label.
+    pub name: Option<String>,
+    /// Optional replacement proxy URL.
+    pub proxy_url: Option<String>,
+    /// Optional replacement proxy username. `Some(None)` clears the field.
+    pub proxy_username: Option<Option<String>>,
+    /// Optional replacement proxy password. `Some(None)` clears the field.
+    pub proxy_password: Option<Option<String>>,
+    /// Optional replacement status.
+    pub status: Option<String>,
+}
+
+/// Result of probing one stored proxy config against the upstream base URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyConfigCheckResult {
+    /// Whether the probe reached the upstream successfully.
+    pub ok: bool,
+    /// Human-readable status summary.
+    pub message: String,
+    /// Optional observed HTTP status code.
+    pub status_code: Option<u16>,
 }
 
 /// Image edit input used by the public service layer.
@@ -255,6 +336,16 @@ impl AppService {
         self.storage.control.list_accounts().await
     }
 
+    /// Lists admin-visible account rows including effective proxy resolution.
+    pub async fn list_admin_accounts(&self) -> Result<Vec<AdminAccountView>> {
+        let accounts = self.storage.control.list_accounts().await?;
+        let mut items = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            items.push(self.admin_account_view(account).await?);
+        }
+        Ok(items)
+    }
+
     /// Updates one account by access token and returns the updated record.
     pub async fn update_account(
         &self,
@@ -288,8 +379,131 @@ impl AppService {
         if let Some(value) = update.request_min_start_interval_ms {
             account.request_min_start_interval_ms = Some(value);
         }
+        if update.proxy_mode.is_some() || update.proxy_config_id.is_some() {
+            let proxy_mode = match update.proxy_mode.as_deref() {
+                Some(raw) => crate::models::AccountProxyMode::parse(raw)
+                    .ok_or_else(|| anyhow!("proxy_mode must be inherit, direct, or fixed"))?,
+                None => account.proxy_mode,
+            };
+            let proxy_config_id = match &update.proxy_config_id {
+                Some(value) => normalize_optional_string(value.as_deref()),
+                None => account.proxy_config_id.clone(),
+            };
+            account.proxy_mode = proxy_mode;
+            account.proxy_config_id = match proxy_mode {
+                crate::models::AccountProxyMode::Fixed => {
+                    let proxy_id = proxy_config_id.as_deref().ok_or_else(|| {
+                        anyhow!("proxy_config_id is required when proxy_mode=`fixed`")
+                    })?;
+                    let proxy = self
+                        .storage
+                        .control
+                        .get_proxy_config(proxy_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("proxy config `{proxy_id}` not found"))?;
+                    if proxy.status != "active" {
+                        bail!("proxy config `{proxy_id}` is not active");
+                    }
+                    Some(proxy.id)
+                }
+                crate::models::AccountProxyMode::Direct
+                | crate::models::AccountProxyMode::Inherit => None,
+            };
+        }
         self.storage.control.upsert_account(&account).await?;
         Ok(Some(account))
+    }
+
+    /// Lists all stored proxy configs.
+    pub async fn list_proxy_configs(&self) -> Result<Vec<ProxyConfigRecord>> {
+        self.storage.control.list_proxy_configs().await
+    }
+
+    /// Creates one reusable proxy config and returns the stored row.
+    pub async fn create_proxy_config(
+        &self,
+        input: &ProxyConfigCreate,
+    ) -> Result<ProxyConfigRecord> {
+        let now = unix_timestamp_secs();
+        let record = ProxyConfigRecord {
+            id: format!("proxy_{}", Uuid::new_v4().simple()),
+            name: normalize_required_string(&input.name, "name")?,
+            proxy_url: normalize_proxy_url(&input.proxy_url)?,
+            proxy_username: normalize_optional_string(input.proxy_username.as_deref()),
+            proxy_password: normalize_optional_string(input.proxy_password.as_deref()),
+            status: normalize_proxy_status(input.status.as_deref().unwrap_or("active"))?,
+            created_at: now,
+            updated_at: now,
+        };
+        self.storage.control.upsert_proxy_config(&record).await?;
+        Ok(record)
+    }
+
+    /// Updates one stored proxy config and returns the updated row.
+    pub async fn update_proxy_config(
+        &self,
+        proxy_id: &str,
+        update: &ProxyConfigUpdate,
+    ) -> Result<Option<ProxyConfigRecord>> {
+        let Some(mut record) = self.storage.control.get_proxy_config(proxy_id).await? else {
+            return Ok(None);
+        };
+        if let Some(name) = update.name.as_deref() {
+            record.name = normalize_required_string(name, "name")?;
+        }
+        if let Some(proxy_url) = update.proxy_url.as_deref() {
+            record.proxy_url = normalize_proxy_url(proxy_url)?;
+        }
+        if let Some(proxy_username) = &update.proxy_username {
+            record.proxy_username = normalize_optional_string(proxy_username.as_deref());
+        }
+        if let Some(proxy_password) = &update.proxy_password {
+            record.proxy_password = normalize_optional_string(proxy_password.as_deref());
+        }
+        if let Some(status) = update.status.as_deref() {
+            record.status = normalize_proxy_status(status)?;
+        }
+        record.updated_at = unix_timestamp_secs();
+        self.storage.control.upsert_proxy_config(&record).await?;
+        Ok(Some(record))
+    }
+
+    /// Deletes one stored proxy config when no accounts still bind it.
+    pub async fn delete_proxy_config(&self, proxy_id: &str) -> Result<bool> {
+        if self.storage.control.count_accounts_bound_to_proxy_config(proxy_id).await? > 0 {
+            bail!("proxy config `{proxy_id}` is still bound to one or more accounts");
+        }
+        self.storage.control.delete_proxy_config(proxy_id).await
+    }
+
+    /// Checks whether one stored proxy config can reach the configured upstream.
+    pub async fn check_proxy_config(&self, proxy_id: &str) -> Result<ProxyConfigCheckResult> {
+        let proxy = self
+            .storage
+            .control
+            .get_proxy_config(proxy_id)
+            .await?
+            .ok_or_else(|| anyhow!("proxy config `{proxy_id}` not found"))?;
+        let proxy_url = render_proxy_url_for_check(
+            &proxy.proxy_url,
+            proxy.proxy_username.as_deref(),
+            proxy.proxy_password.as_deref(),
+        )?;
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(proxy_url).context("invalid proxy URL")?)
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("build proxy check client failed")?;
+        let response = client
+            .get(self.upstream.base_url())
+            .send()
+            .await
+            .context("proxy check request failed")?;
+        Ok(ProxyConfigCheckResult {
+            ok: response.status().is_success(),
+            message: format!("HTTP {}", response.status()),
+            status_code: Some(response.status().as_u16()),
+        })
     }
 
     /// Creates one downstream API key and returns the stored plaintext secret.
@@ -690,20 +904,18 @@ impl AppService {
                 continue;
             }
             selected_account_name = account.name.clone();
+            let resolved_proxy = self.resolve_account_proxy(&account).await?;
             let result = match &edit_input {
                 Some(edit_input) => {
                     self.upstream
-                        .edit_image(
-                            &account,
-                            prompt,
-                            requested_model,
-                            &edit_input.image_data,
-                            &edit_input.file_name,
-                            &edit_input.mime_type,
-                        )
+                        .edit_image(&account, &resolved_proxy, prompt, requested_model, edit_input)
                         .await
                 }
-                None => self.upstream.generate_image(&account, prompt, requested_model).await,
+                None => {
+                    self.upstream
+                        .generate_image(&account, &resolved_proxy, prompt, requested_model)
+                        .await
+                }
             };
             match result {
                 Ok(result) => {
@@ -781,7 +993,12 @@ impl AppService {
                 last_error = Some("no available accounts".to_string());
                 continue;
             }
-            match self.upstream.complete_text(&account, prompt, requested_model).await {
+            let resolved_proxy = self.resolve_account_proxy(&account).await?;
+            match self
+                .upstream
+                .complete_text(&account, &resolved_proxy, prompt, requested_model)
+                .await
+            {
                 Ok(result) => {
                     self.record_account_success(&account).await?;
                     let event = UsageEventRecord {
@@ -844,7 +1061,12 @@ impl AppService {
                 last_error = Some("no available accounts".to_string());
                 continue;
             }
-            match self.upstream.start_text_stream(&account, prompt, requested_model).await {
+            let resolved_proxy = self.resolve_account_proxy(&account).await?;
+            match self
+                .upstream
+                .start_text_stream(&account, &resolved_proxy, prompt, requested_model)
+                .await
+            {
                 Ok(stream) => {
                     self.record_account_success(&account).await?;
                     let event = UsageEventRecord {
@@ -899,12 +1121,9 @@ impl AppService {
 
     async fn acquire_account_for_key(&self, key: &ApiKeyRecord) -> Result<(AccountRecord, Lease)> {
         loop {
-            let accounts = self.storage.control.list_accounts().await?;
-            let mut remaining: HashMap<String, AccountRecord> = accounts
-                .into_iter()
-                .filter(is_account_selectable)
-                .map(|account| (account.name.clone(), account))
-                .collect();
+            let accounts = self.routable_accounts_for_key(key).await?;
+            let mut remaining: BTreeMap<String, AccountRecord> =
+                accounts.into_iter().map(|account| (account.name.clone(), account)).collect();
             if remaining.is_empty() {
                 bail!("no available accounts");
             }
@@ -948,7 +1167,7 @@ impl AppService {
         account: &AccountRecord,
     ) -> Result<Lease, Option<Duration>> {
         match self.account_scheduler.try_acquire(
-            &format!("account:{}", account.name),
+            &account_scheduler_key(account),
             account.request_max_concurrency,
             account.request_min_start_interval_ms,
             Instant::now(),
@@ -958,13 +1177,46 @@ impl AppService {
         }
     }
 
-    async fn refresh_account_if_needed(&self, account: AccountRecord) -> Result<AccountRecord> {
-        let Some(last_refresh_at) = account.last_refresh_at else {
-            return Ok(account);
+    async fn routable_accounts_for_key(&self, key: &ApiKeyRecord) -> Result<Vec<AccountRecord>> {
+        let accounts: Vec<_> = self
+            .storage
+            .control
+            .list_accounts()
+            .await?
+            .into_iter()
+            .filter(is_account_selectable)
+            .collect();
+        if accounts.is_empty() {
+            bail!("no available accounts");
+        }
+
+        let Some(group_id) = key.account_group_id.as_deref() else {
+            return Ok(accounts);
         };
-        let stale =
-            unix_timestamp_secs().saturating_sub(last_refresh_at) >= DEFAULT_REFRESH_SECONDS as i64;
-        if !stale {
+
+        let account_names = self
+            .storage
+            .control
+            .get_account_group_account_names(group_id)
+            .await?
+            .ok_or_else(|| anyhow!("configured account_group_id does not exist"))?;
+        if key.route_strategy.eq_ignore_ascii_case("fixed") && account_names.len() != 1 {
+            bail!("fixed route_strategy requires an account group with exactly one account");
+        }
+        let allowed_names: HashSet<_> = account_names.into_iter().collect();
+        let filtered: Vec<_> =
+            accounts.into_iter().filter(|account| allowed_names.contains(&account.name)).collect();
+        if filtered.is_empty() {
+            bail!("no configured route accounts are available");
+        }
+        Ok(filtered)
+    }
+
+    async fn refresh_account_if_needed(&self, account: AccountRecord) -> Result<AccountRecord> {
+        let stale = account.last_refresh_at.is_some_and(|last_refresh_at| {
+            unix_timestamp_secs().saturating_sub(last_refresh_at) >= DEFAULT_REFRESH_SECONDS as i64
+        });
+        if !stale && !should_refresh_access_token(&account) {
             return Ok(account);
         }
         let refreshed = self.refresh_account(account).await?;
@@ -973,28 +1225,50 @@ impl AppService {
     }
 
     async fn refresh_account(&self, mut account: AccountRecord) -> Result<AccountRecord> {
-        match self.upstream.fetch_account_metadata(&account).await {
+        let resolved_proxy = self.resolve_account_proxy(&account).await?;
+        let _ = self.maybe_refresh_account_access_token(&mut account, &resolved_proxy, false).await;
+        match self.upstream.fetch_account_metadata(&account, &resolved_proxy).await {
             Ok(metadata) => {
-                account.email = metadata.email;
-                account.user_id = metadata.user_id;
-                account.plan_type = metadata.plan_type;
-                account.default_model_slug = metadata.default_model_slug;
-                account.quota_remaining = metadata.quota_remaining;
-                account.quota_known = metadata.quota_known;
-                account.restore_at = metadata.restore_at;
-                account.status = if account.quota_known && account.quota_remaining <= 0 {
-                    "limited".to_string()
-                } else {
-                    "active".to_string()
-                };
+                apply_account_metadata(&mut account, metadata);
                 account.last_refresh_at = Some(unix_timestamp_secs());
                 account.last_error = None;
                 Ok(account)
             }
             Err(error) => {
+                let token_invalid = is_token_invalid_error(&error.to_string());
+                if token_invalid {
+                    match self
+                        .maybe_refresh_account_access_token(&mut account, &resolved_proxy, true)
+                        .await
+                    {
+                        Ok(true) => match self
+                            .upstream
+                            .fetch_account_metadata(&account, &resolved_proxy)
+                            .await
+                        {
+                            Ok(metadata) => {
+                                apply_account_metadata(&mut account, metadata);
+                                account.last_refresh_at = Some(unix_timestamp_secs());
+                                account.last_error = None;
+                                return Ok(account);
+                            }
+                            Err(retry_error) => {
+                                account.last_error = Some(retry_error.to_string());
+                            }
+                        },
+                        Ok(false) => {
+                            account.last_error = Some(error.to_string());
+                        }
+                        Err(refresh_error) => {
+                            account.last_error =
+                                Some(format!("session refresh failed: {refresh_error}"));
+                        }
+                    }
+                } else {
+                    account.last_error = Some(error.to_string());
+                }
                 account.last_refresh_at = Some(unix_timestamp_secs());
-                account.last_error = Some(error.to_string());
-                if is_token_invalid_error(&error.to_string()) {
+                if token_invalid {
                     account.status = "invalid".to_string();
                     account.quota_remaining = 0;
                     account.quota_known = true;
@@ -1002,6 +1276,100 @@ impl AppService {
                 Ok(account)
             }
         }
+    }
+
+    async fn maybe_refresh_account_access_token(
+        &self,
+        account: &mut AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
+        force: bool,
+    ) -> Result<bool> {
+        if !force && !should_refresh_access_token(account) {
+            return Ok(false);
+        }
+        let mut profile = account.browser_profile();
+        let current_session_token = profile.session_token.clone();
+        let has_session_token = current_session_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+        if !has_session_token {
+            return Ok(false);
+        }
+        let refreshed = self.upstream.refresh_session_access_token(account, resolved_proxy).await?;
+        let next_session_token = refreshed
+            .session_token
+            .or(current_session_token.clone())
+            .filter(|value| !value.trim().is_empty());
+        let access_token_changed = account.access_token != refreshed.access_token;
+        let session_token_changed = next_session_token != current_session_token;
+        if !access_token_changed && !session_token_changed {
+            return Ok(false);
+        }
+        account.access_token = refreshed.access_token;
+        profile.session_token = next_session_token;
+        account.browser_profile_json = serde_json::to_string(&profile)?;
+        self.storage.control.upsert_account(account).await?;
+        Ok(true)
+    }
+
+    async fn resolve_account_proxy(&self, account: &AccountRecord) -> Result<ResolvedAccountProxy> {
+        match account.proxy_mode {
+            crate::models::AccountProxyMode::Direct => Ok(ResolvedAccountProxy {
+                source: "direct",
+                proxy_url: None,
+                proxy_username: None,
+                proxy_password: None,
+                proxy_config_id: None,
+                proxy_config_name: None,
+            }),
+            crate::models::AccountProxyMode::Inherit => Ok(ResolvedAccountProxy {
+                source: "inherit",
+                proxy_url: self.upstream.default_proxy_url(),
+                proxy_username: None,
+                proxy_password: None,
+                proxy_config_id: None,
+                proxy_config_name: None,
+            }),
+            crate::models::AccountProxyMode::Fixed => {
+                let proxy_id = account
+                    .proxy_config_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("proxy_config_id is required when proxy_mode=`fixed`")
+                    })?;
+                let proxy = self
+                    .storage
+                    .control
+                    .get_proxy_config(proxy_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("proxy config `{proxy_id}` not found"))?;
+                if proxy.status != "active" {
+                    bail!("proxy config `{proxy_id}` is not active");
+                }
+                Ok(ResolvedAccountProxy {
+                    source: "fixed",
+                    proxy_url: Some(proxy.proxy_url.clone()),
+                    proxy_username: proxy.proxy_username.clone(),
+                    proxy_password: proxy.proxy_password.clone(),
+                    proxy_config_id: Some(proxy.id.clone()),
+                    proxy_config_name: Some(proxy.name.clone()),
+                })
+            }
+        }
+    }
+
+    async fn admin_account_view(&self, account: AccountRecord) -> Result<AdminAccountView> {
+        let resolved_proxy = self.resolve_account_proxy(&account).await?;
+        Ok(AdminAccountView {
+            account,
+            effective_proxy_source: resolved_proxy.source.to_string(),
+            effective_proxy_url: resolved_proxy.proxy_url,
+            effective_proxy_config_name: resolved_proxy.proxy_config_name,
+        })
     }
 
     async fn record_account_success(&self, account: &AccountRecord) -> Result<()> {
@@ -1040,12 +1408,56 @@ impl AppService {
     }
 }
 
+fn apply_account_metadata(account: &mut AccountRecord, metadata: AccountMetadata) {
+    account.email = metadata.email;
+    account.user_id = metadata.user_id;
+    account.plan_type = metadata.plan_type;
+    account.default_model_slug = metadata.default_model_slug;
+    account.quota_remaining = metadata.quota_remaining;
+    account.quota_known = metadata.quota_known;
+    account.restore_at = metadata.restore_at;
+    account.status = if account.quota_known && account.quota_remaining <= 0 {
+        "limited".to_string()
+    } else {
+        "active".to_string()
+    };
+}
+
+fn should_refresh_access_token(account: &AccountRecord) -> bool {
+    let has_session_token = account
+        .browser_profile()
+        .session_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if !has_session_token {
+        return false;
+    }
+    access_token_expires_at(&account.access_token).is_some_and(|expires_at| {
+        expires_at <= unix_timestamp_secs() + ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS
+    })
+}
+
 fn is_account_selectable(account: &AccountRecord) -> bool {
     account.status != "invalid" && account.status != "disabled"
 }
 
 fn is_account_routeable(account: &AccountRecord) -> bool {
     account.status == "active"
+}
+
+fn account_scheduler_key(account: &AccountRecord) -> String {
+    format!("account:{}", account_scheduler_identity(account))
+}
+
+fn account_scheduler_identity(account: &AccountRecord) -> &str {
+    account
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&account.name)
 }
 
 fn ensure_key_can_consume(
@@ -1082,6 +1494,14 @@ fn normalize_route_strategy(raw: &str) -> Result<String> {
     }
 }
 
+fn normalize_proxy_status(raw: &str) -> Result<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "active" => Ok("active".to_string()),
+        "disabled" => Ok("disabled".to_string()),
+        _ => bail!("status must be active or disabled"),
+    }
+}
+
 fn normalize_required_string(raw: &str, field_name: &str) -> Result<String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -1092,6 +1512,27 @@ fn normalize_required_string(raw: &str, field_name: &str) -> Result<String> {
 
 fn normalize_optional_string(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string)
+}
+
+fn normalize_proxy_url(raw: &str) -> Result<String> {
+    let value = normalize_required_string(raw, "proxy_url")?;
+    reqwest::Url::parse(&value).context("proxy_url must be a valid URL")?;
+    Ok(value)
+}
+
+fn render_proxy_url_for_check(
+    proxy_url: &str,
+    proxy_username: Option<&str>,
+    proxy_password: Option<&str>,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(proxy_url).context("proxy_url must be a valid URL")?;
+    if let Some(username) = proxy_username.map(str::trim).filter(|value| !value.is_empty()) {
+        url.set_username(username).map_err(|_| anyhow!("invalid proxy username"))?;
+    }
+    if let Some(password) = proxy_password.map(str::trim).filter(|value| !value.is_empty()) {
+        url.set_password(Some(password)).map_err(|_| anyhow!("invalid proxy password"))?;
+    }
+    Ok(url.to_string())
 }
 
 fn validate_quota_total_calls(value: i64) -> Result<i64> {
@@ -1125,4 +1566,272 @@ fn unix_timestamp_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("current time should be after unix epoch")
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::ResolvedPaths,
+        models::{AccountProxyMode, AccountRecord, BrowserProfile, ProxyConfigRecord},
+        storage::Storage,
+    };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use serde_json::json;
+    use tempfile::TempDir;
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    async fn build_service() -> (TempDir, AppService) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::new(temp.path().to_path_buf());
+        let storage = Storage::open(&paths).await.expect("storage opens");
+        let service = AppService::new(
+            storage,
+            "admin-secret".to_string(),
+            ChatgptUpstreamClient::new("http://127.0.0.1:9", None),
+        )
+        .await
+        .expect("service init");
+        (temp, service)
+    }
+
+    async fn build_service_with_base_url(base_url: &str) -> (TempDir, AppService) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::new(temp.path().to_path_buf());
+        let storage = Storage::open(&paths).await.expect("storage opens");
+        let service = AppService::new(
+            storage,
+            "admin-secret".to_string(),
+            ChatgptUpstreamClient::new(base_url, None),
+        )
+        .await
+        .expect("service init");
+        (temp, service)
+    }
+
+    fn access_token_with_exp(exp: i64) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(json!({ "exp": exp }).to_string());
+        format!("{header}.{payload}.sig")
+    }
+
+    fn browser_profile_json(session_token: &str) -> String {
+        serde_json::to_string(&BrowserProfile {
+            session_token: Some(session_token.to_string()),
+            user_agent: None,
+            impersonate_browser: Some("edge".to_string()),
+            oai_device_id: None,
+            sec_ch_ua: None,
+            sec_ch_ua_mobile: None,
+            sec_ch_ua_platform: None,
+        })
+        .expect("browser profile json")
+    }
+
+    #[tokio::test]
+    async fn account_scheduler_limits_are_shared_by_upstream_user_id() {
+        let (_temp, service) = build_service().await;
+
+        let mut alpha = AccountRecord::minimal("alpha", "tok-alpha");
+        alpha.user_id = Some("user-123".to_string());
+        alpha.request_max_concurrency = Some(1);
+
+        let mut beta = AccountRecord::minimal("beta", "tok-beta");
+        beta.user_id = Some("user-123".to_string());
+        beta.request_max_concurrency = Some(1);
+
+        let lease = service
+            .try_acquire_account_lease(&alpha)
+            .expect("first account should acquire shared slot");
+        let rejection = service
+            .try_acquire_account_lease(&beta)
+            .expect_err("same upstream user should not get a second local slot");
+
+        assert_eq!(rejection, None);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn resolve_account_proxy_prefers_fixed_direct_and_inherit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::new(temp.path().to_path_buf());
+        let storage = Storage::open(&paths).await.expect("storage");
+        let service = AppService::new(
+            storage.clone(),
+            "admin".to_string(),
+            ChatgptUpstreamClient::new(
+                "http://127.0.0.1:9",
+                Some("http://127.0.0.1:11118".to_string()),
+            ),
+        )
+        .await
+        .expect("service");
+
+        storage
+            .control
+            .upsert_proxy_config(&ProxyConfigRecord {
+                id: "proxy-a".to_string(),
+                name: "proxy-a".to_string(),
+                proxy_url: "http://127.0.0.1:22222".to_string(),
+                proxy_username: Some("bob".to_string()),
+                proxy_password: Some("pw".to_string()),
+                status: "active".to_string(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .expect("seed proxy");
+
+        let inherit = AccountRecord::minimal("inherit", "tok-inherit");
+
+        let mut direct = AccountRecord::minimal("direct", "tok-direct");
+        direct.proxy_mode = AccountProxyMode::Direct;
+
+        let mut fixed = AccountRecord::minimal("fixed", "tok-fixed");
+        fixed.proxy_mode = AccountProxyMode::Fixed;
+        fixed.proxy_config_id = Some("proxy-a".to_string());
+
+        let inherit_resolved = service.resolve_account_proxy(&inherit).await.expect("inherit");
+        let direct_resolved = service.resolve_account_proxy(&direct).await.expect("direct");
+        let fixed_resolved = service.resolve_account_proxy(&fixed).await.expect("fixed");
+
+        assert_eq!(inherit_resolved.proxy_url.as_deref(), Some("http://127.0.0.1:11118"));
+        assert_eq!(direct_resolved.proxy_url, None);
+        assert_eq!(fixed_resolved.proxy_url.as_deref(), Some("http://127.0.0.1:22222"));
+        assert_eq!(fixed_resolved.proxy_config_name.as_deref(), Some("proxy-a"));
+    }
+
+    #[tokio::test]
+    async fn refresh_account_if_needed_renews_expiring_access_token_from_session_token() {
+        let server = MockServer::start().await;
+        let new_access_token = "fresh_access_token";
+
+        Mock::given(method("GET"))
+            .and(path("/api/auth/session"))
+            .and(header("cookie", "__Secure-next-auth.session-token=session_cookie"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "set-cookie",
+                        "__Secure-next-auth.session-token=rotated_session; Path=/; HttpOnly; Secure",
+                    )
+                    .set_body_json(json!({
+                        "accessToken": new_access_token
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backend-api/me"))
+            .and(header("authorization", format!("Bearer {new_access_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "user_renewed",
+                "email": "renewed@example.com"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backend-api/conversation/init"))
+            .and(header("authorization", format!("Bearer {new_access_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "default_model_slug": "gpt-image-1",
+                "limits_progress": [{
+                    "feature_name": "image_gen",
+                    "remaining": 9,
+                    "reset_after": "2026-04-24T12:00:00Z"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (_temp, service) = build_service_with_base_url(&server.uri()).await;
+        let mut account = AccountRecord::minimal(
+            "acct-expiring",
+            &access_token_with_exp(unix_timestamp_secs() - 30),
+        );
+        account.browser_profile_json = browser_profile_json("session_cookie");
+        account.last_refresh_at = Some(unix_timestamp_secs());
+
+        let refreshed = service.refresh_account_if_needed(account).await.expect("refresh account");
+
+        assert_eq!(refreshed.access_token, new_access_token);
+        assert_eq!(refreshed.status, "active");
+        assert_eq!(refreshed.email.as_deref(), Some("renewed@example.com"));
+        assert_eq!(refreshed.user_id.as_deref(), Some("user_renewed"));
+        assert_eq!(refreshed.restore_at.as_deref(), Some("2026-04-24T12:00:00Z"));
+        assert_eq!(refreshed.browser_profile().session_token.as_deref(), Some("rotated_session"));
+
+        let persisted = service
+            .storage
+            .control
+            .find_account_by_access_token(new_access_token)
+            .await
+            .expect("find account")
+            .expect("persisted account");
+        assert_eq!(persisted.name, "acct-expiring");
+    }
+
+    #[tokio::test]
+    async fn refresh_account_retries_token_invalid_with_session_refresh() {
+        let server = MockServer::start().await;
+        let old_access_token = "stale_access_token";
+        let new_access_token = "fresh_after_retry";
+
+        Mock::given(method("GET"))
+            .and(path("/backend-api/me"))
+            .and(header("authorization", format!("Bearer {old_access_token}")))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/auth/session"))
+            .and(header("cookie", "__Secure-next-auth.session-token=session_cookie"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": new_access_token
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/backend-api/me"))
+            .and(header("authorization", format!("Bearer {new_access_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "user_retry",
+                "email": "retry@example.com"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/backend-api/conversation/init"))
+            .and(header("authorization", format!("Bearer {new_access_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "default_model_slug": "gpt-image-1",
+                "limits_progress": [{
+                    "feature_name": "image_gen",
+                    "remaining": 4,
+                    "reset_after": "2026-04-24T18:00:00Z"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (_temp, service) = build_service_with_base_url(&server.uri()).await;
+        let mut account = AccountRecord::minimal("acct-invalid", old_access_token);
+        account.browser_profile_json = browser_profile_json("session_cookie");
+
+        let refreshed = service.refresh_account(account).await.expect("refresh account");
+
+        assert_eq!(refreshed.access_token, new_access_token);
+        assert_eq!(refreshed.status, "active");
+        assert_eq!(refreshed.email.as_deref(), Some("retry@example.com"));
+        assert_eq!(refreshed.user_id.as_deref(), Some("user_retry"));
+        assert_eq!(refreshed.restore_at.as_deref(), Some("2026-04-24T18:00:00Z"));
+    }
 }

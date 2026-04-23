@@ -27,7 +27,20 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             fail_count INTEGER NOT NULL DEFAULT 0,
             request_max_concurrency INTEGER,
             request_min_start_interval_ms INTEGER,
+            proxy_mode TEXT NOT NULL DEFAULT 'inherit',
+            proxy_config_id TEXT,
             browser_profile_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS proxy_configs (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            proxy_url TEXT NOT NULL,
+            proxy_username TEXT,
+            proxy_password TEXT,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS account_groups (
@@ -79,6 +92,16 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
         conn,
         "quota_known",
         "ALTER TABLE accounts ADD COLUMN quota_known INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_account_column(
+        conn,
+        "proxy_mode",
+        "ALTER TABLE accounts ADD COLUMN proxy_mode TEXT NOT NULL DEFAULT 'inherit'",
+    )?;
+    ensure_account_column(
+        conn,
+        "proxy_config_id",
+        "ALTER TABLE accounts ADD COLUMN proxy_config_id TEXT",
     )?;
     ensure_api_key_call_quota_columns(conn)?;
     ensure_api_key_secret_plaintext_column(conn)?;

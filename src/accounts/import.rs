@@ -105,6 +105,8 @@ pub fn build_account_record(seed: ImportedAccountSeed) -> AccountRecord {
         fail_count: 0,
         request_max_concurrency: None,
         request_min_start_interval_ms: None,
+        proxy_mode: crate::models::AccountProxyMode::Inherit,
+        proxy_config_id: None,
         browser_profile_json: serde_json::to_string(&seed.browser_profile)
             .expect("browser profile serialization should not fail"),
     }

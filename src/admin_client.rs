@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 
-use crate::models::{AccountRecord, ApiKeyRecord, UsageEventRecord};
+use crate::models::{AccountRecord, ApiKeyRecord, ProxyConfigRecord, UsageEventRecord};
 
 /// Lists imported accounts from the running service.
 pub async fn list_accounts(base_url: &str, admin_token: &str) -> Result<Vec<AccountRecord>> {
@@ -24,6 +24,15 @@ pub async fn list_usage(
     limit: u64,
 ) -> Result<Vec<UsageEventRecord>> {
     let url = format!("{}/admin/usage?limit={limit}", base_url.trim_end_matches('/'));
+    fetch_json(&url, admin_token).await
+}
+
+/// Lists stored proxy configs from the running service.
+pub async fn list_proxy_configs(
+    base_url: &str,
+    admin_token: &str,
+) -> Result<Vec<ProxyConfigRecord>> {
+    let url = format!("{}/admin/proxy-configs", base_url.trim_end_matches('/'));
     fetch_json(&url, admin_token).await
 }
 

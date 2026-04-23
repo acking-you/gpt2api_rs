@@ -2,7 +2,7 @@
 
 use gpt2api_rs::{
     admin_client,
-    models::{AccountRecord, ApiKeyRecord, UsageEventRecord},
+    models::{AccountRecord, ApiKeyRecord, ProxyConfigRecord, UsageEventRecord},
 };
 use wiremock::{
     matchers::{header, method, path, query_param},
@@ -68,4 +68,33 @@ async fn list_usage_calls_admin_rest() {
 
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].event_id, "event-1");
+}
+
+/// Fetches proxy configs from the admin REST surface.
+#[tokio::test]
+async fn list_proxy_configs_calls_admin_rest() {
+    let server = MockServer::start().await;
+    let payload = vec![ProxyConfigRecord {
+        id: "proxy-1".to_string(),
+        name: "proxy-1".to_string(),
+        proxy_url: "http://127.0.0.1:11118".to_string(),
+        proxy_username: None,
+        proxy_password: None,
+        status: "active".to_string(),
+        created_at: 1,
+        updated_at: 1,
+    }];
+
+    Mock::given(method("GET"))
+        .and(path("/admin/proxy-configs"))
+        .and(header("authorization", "Bearer secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&payload))
+        .mount(&server)
+        .await;
+
+    let proxy_configs =
+        admin_client::list_proxy_configs(&server.uri(), "secret").await.expect("proxy response");
+
+    assert_eq!(proxy_configs.len(), 1);
+    assert_eq!(proxy_configs[0].id, "proxy-1");
 }

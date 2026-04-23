@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 
 use super::migrations::bootstrap_control_schema;
 use crate::{
-    models::{AccountRecord, ApiKeyRecord, UsageEventRecord},
+    models::{AccountProxyMode, AccountRecord, ApiKeyRecord, ProxyConfigRecord, UsageEventRecord},
     storage::outbox::OutboxRow,
 };
 
@@ -30,6 +30,65 @@ fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
         account_group_id: row.get(8)?,
         request_max_concurrency: row.get(9)?,
         request_min_start_interval_ms: row.get(10)?,
+    })
+}
+
+fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
+    let source_kind = match row.get::<_, String>(2)?.as_str() {
+        "token" => crate::models::AccountSourceKind::Token,
+        "session_json" => crate::models::AccountSourceKind::SessionJson,
+        "cpa_json" => crate::models::AccountSourceKind::CpaJson,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("unknown source kind: {other}").into(),
+            ))
+        }
+    };
+    let proxy_mode_raw: String = row.get(18)?;
+    let proxy_mode = AccountProxyMode::parse(&proxy_mode_raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            18,
+            rusqlite::types::Type::Text,
+            format!("unknown proxy mode: {proxy_mode_raw}").into(),
+        )
+    })?;
+    Ok(AccountRecord {
+        name: row.get(0)?,
+        access_token: row.get(1)?,
+        source_kind,
+        email: row.get(3)?,
+        user_id: row.get(4)?,
+        plan_type: row.get(5)?,
+        default_model_slug: row.get(6)?,
+        status: row.get(7)?,
+        quota_remaining: row.get(8)?,
+        quota_known: row.get(9)?,
+        restore_at: row.get(10)?,
+        last_refresh_at: row.get(11)?,
+        last_used_at: row.get(12)?,
+        last_error: row.get(13)?,
+        success_count: row.get(14)?,
+        fail_count: row.get(15)?,
+        request_max_concurrency: row.get(16)?,
+        request_min_start_interval_ms: row.get(17)?,
+        proxy_mode,
+        proxy_config_id: row.get(19)?,
+        browser_profile_json: row.get(20)?,
+    })
+}
+
+fn proxy_config_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfigRecord> {
+    Ok(ProxyConfigRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        proxy_url: row.get(2)?,
+        proxy_username: row.get(3)?,
+        proxy_password: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -72,46 +131,13 @@ impl ControlDb {
                     name, access_token, source_kind, email, user_id, plan_type,
                     default_model_slug, status, quota_remaining, quota_known, restore_at,
                     last_refresh_at, last_used_at, last_error, success_count, fail_count,
-                    request_max_concurrency, request_min_start_interval_ms, browser_profile_json
+                    request_max_concurrency, request_min_start_interval_ms, proxy_mode,
+                    proxy_config_id, browser_profile_json
                 FROM accounts
                 ORDER BY name ASC
                 "#,
             )?;
-            let rows = stmt.query_map([], |row| {
-                let source_kind = match row.get::<_, String>(2)?.as_str() {
-                    "token" => crate::models::AccountSourceKind::Token,
-                    "session_json" => crate::models::AccountSourceKind::SessionJson,
-                    "cpa_json" => crate::models::AccountSourceKind::CpaJson,
-                    other => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            format!("unknown source kind: {other}").into(),
-                        ))
-                    }
-                };
-                Ok(AccountRecord {
-                    name: row.get(0)?,
-                    access_token: row.get(1)?,
-                    source_kind,
-                    email: row.get(3)?,
-                    user_id: row.get(4)?,
-                    plan_type: row.get(5)?,
-                    default_model_slug: row.get(6)?,
-                    status: row.get(7)?,
-                    quota_remaining: row.get(8)?,
-                    quota_known: row.get(9)?,
-                    restore_at: row.get(10)?,
-                    last_refresh_at: row.get(11)?,
-                    last_used_at: row.get(12)?,
-                    last_error: row.get(13)?,
-                    success_count: row.get(14)?,
-                    fail_count: row.get(15)?,
-                    request_max_concurrency: row.get(16)?,
-                    request_min_start_interval_ms: row.get(17)?,
-                    browser_profile_json: row.get(18)?,
-                })
-            })?;
+            let rows = stmt.query_map([], account_from_row)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
         .await?
@@ -129,47 +155,14 @@ impl ControlDb {
                     name, access_token, source_kind, email, user_id, plan_type,
                     default_model_slug, status, quota_remaining, quota_known, restore_at,
                     last_refresh_at, last_used_at, last_error, success_count, fail_count,
-                    request_max_concurrency, request_min_start_interval_ms, browser_profile_json
+                    request_max_concurrency, request_min_start_interval_ms, proxy_mode,
+                    proxy_config_id, browser_profile_json
                 FROM accounts
                 WHERE name = ?1
                 LIMIT 1
                 "#,
             )?;
-            let row = stmt.query_row([account_name], |row| {
-                let source_kind = match row.get::<_, String>(2)?.as_str() {
-                    "token" => crate::models::AccountSourceKind::Token,
-                    "session_json" => crate::models::AccountSourceKind::SessionJson,
-                    "cpa_json" => crate::models::AccountSourceKind::CpaJson,
-                    other => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            format!("unknown source kind: {other}").into(),
-                        ))
-                    }
-                };
-                Ok(AccountRecord {
-                    name: row.get(0)?,
-                    access_token: row.get(1)?,
-                    source_kind,
-                    email: row.get(3)?,
-                    user_id: row.get(4)?,
-                    plan_type: row.get(5)?,
-                    default_model_slug: row.get(6)?,
-                    status: row.get(7)?,
-                    quota_remaining: row.get(8)?,
-                    quota_known: row.get(9)?,
-                    restore_at: row.get(10)?,
-                    last_refresh_at: row.get(11)?,
-                    last_used_at: row.get(12)?,
-                    last_error: row.get(13)?,
-                    success_count: row.get(14)?,
-                    fail_count: row.get(15)?,
-                    request_max_concurrency: row.get(16)?,
-                    request_min_start_interval_ms: row.get(17)?,
-                    browser_profile_json: row.get(18)?,
-                })
-            });
+            let row = stmt.query_row([account_name], account_from_row);
             match row {
                 Ok(record) => Ok(Some(record)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -194,47 +187,14 @@ impl ControlDb {
                     name, access_token, source_kind, email, user_id, plan_type,
                     default_model_slug, status, quota_remaining, quota_known, restore_at,
                     last_refresh_at, last_used_at, last_error, success_count, fail_count,
-                    request_max_concurrency, request_min_start_interval_ms, browser_profile_json
+                    request_max_concurrency, request_min_start_interval_ms, proxy_mode,
+                    proxy_config_id, browser_profile_json
                 FROM accounts
                 WHERE access_token = ?1
                 LIMIT 1
                 "#,
             )?;
-            let row = stmt.query_row([access_token], |row| {
-                let source_kind = match row.get::<_, String>(2)?.as_str() {
-                    "token" => crate::models::AccountSourceKind::Token,
-                    "session_json" => crate::models::AccountSourceKind::SessionJson,
-                    "cpa_json" => crate::models::AccountSourceKind::CpaJson,
-                    other => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            format!("unknown source kind: {other}").into(),
-                        ))
-                    }
-                };
-                Ok(AccountRecord {
-                    name: row.get(0)?,
-                    access_token: row.get(1)?,
-                    source_kind,
-                    email: row.get(3)?,
-                    user_id: row.get(4)?,
-                    plan_type: row.get(5)?,
-                    default_model_slug: row.get(6)?,
-                    status: row.get(7)?,
-                    quota_remaining: row.get(8)?,
-                    quota_known: row.get(9)?,
-                    restore_at: row.get(10)?,
-                    last_refresh_at: row.get(11)?,
-                    last_used_at: row.get(12)?,
-                    last_error: row.get(13)?,
-                    success_count: row.get(14)?,
-                    fail_count: row.get(15)?,
-                    request_max_concurrency: row.get(16)?,
-                    request_min_start_interval_ms: row.get(17)?,
-                    browser_profile_json: row.get(18)?,
-                })
-            });
+            let row = stmt.query_row([access_token], account_from_row);
             match row {
                 Ok(record) => Ok(Some(record)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -256,8 +216,9 @@ impl ControlDb {
                     name, access_token, source_kind, email, user_id, plan_type,
                     default_model_slug, status, quota_remaining, quota_known, restore_at,
                     last_refresh_at, last_used_at, last_error, success_count, fail_count,
-                    request_max_concurrency, request_min_start_interval_ms, browser_profile_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                    request_max_concurrency, request_min_start_interval_ms, proxy_mode,
+                    proxy_config_id, browser_profile_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                 ON CONFLICT(name) DO UPDATE SET
                     access_token = excluded.access_token,
                     source_kind = excluded.source_kind,
@@ -276,6 +237,8 @@ impl ControlDb {
                     fail_count = excluded.fail_count,
                     request_max_concurrency = excluded.request_max_concurrency,
                     request_min_start_interval_ms = excluded.request_min_start_interval_ms,
+                    proxy_mode = excluded.proxy_mode,
+                    proxy_config_id = excluded.proxy_config_id,
                     browser_profile_json = excluded.browser_profile_json
                 "#,
                 params![
@@ -297,6 +260,8 @@ impl ControlDb {
                     account.fail_count,
                     &account.request_max_concurrency,
                     &account.request_min_start_interval_ms,
+                    account.proxy_mode.as_str(),
+                    &account.proxy_config_id,
                     &account.browser_profile_json,
                 ],
             )?;
@@ -305,6 +270,107 @@ impl ControlDb {
         .await??;
 
         Ok(())
+    }
+
+    /// Fetches one stored proxy config by stable id.
+    pub async fn get_proxy_config(&self, proxy_id: &str) -> Result<Option<ProxyConfigRecord>> {
+        let path = self.path.clone();
+        let proxy_id = proxy_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ProxyConfigRecord>> {
+            let conn = Connection::open(path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, proxy_url, proxy_username, proxy_password, status, created_at, updated_at FROM proxy_configs WHERE id = ?1 LIMIT 1",
+            )?;
+            let row = stmt.query_row([proxy_id], proxy_config_from_row);
+
+            match row {
+                Ok(record) => Ok(Some(record)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        })
+        .await?
+    }
+
+    /// Lists all stored proxy configs ordered by name.
+    pub async fn list_proxy_configs(&self) -> Result<Vec<ProxyConfigRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ProxyConfigRecord>> {
+            let conn = Connection::open(path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, proxy_url, proxy_username, proxy_password, status, created_at, updated_at FROM proxy_configs ORDER BY name ASC",
+            )?;
+            let rows = stmt.query_map([], proxy_config_from_row)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
+    /// Inserts or updates one stored proxy config row.
+    pub async fn upsert_proxy_config(&self, proxy: &ProxyConfigRecord) -> Result<()> {
+        let path = self.path.clone();
+        let proxy = proxy.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = Connection::open(path)?;
+            conn.execute(
+                r#"
+                INSERT INTO proxy_configs (
+                    id, name, proxy_url, proxy_username, proxy_password, status, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    proxy_url = excluded.proxy_url,
+                    proxy_username = excluded.proxy_username,
+                    proxy_password = excluded.proxy_password,
+                    status = excluded.status,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    &proxy.id,
+                    &proxy.name,
+                    &proxy.proxy_url,
+                    &proxy.proxy_username,
+                    &proxy.proxy_password,
+                    &proxy.status,
+                    proxy.created_at,
+                    proxy.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    /// Deletes one stored proxy config by stable id.
+    pub async fn delete_proxy_config(&self, proxy_id: &str) -> Result<bool> {
+        let path = self.path.clone();
+        let proxy_id = proxy_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = Connection::open(path)?;
+            let changed =
+                conn.execute("DELETE FROM proxy_configs WHERE id = ?1", params![proxy_id])?;
+            Ok(changed > 0)
+        })
+        .await?
+    }
+
+    /// Counts how many accounts currently bind one proxy config.
+    pub async fn count_accounts_bound_to_proxy_config(&self, proxy_id: &str) -> Result<u64> {
+        let path = self.path.clone();
+        let proxy_id = proxy_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let conn = Connection::open(path)?;
+            let count: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM accounts WHERE proxy_config_id = ?1",
+                params![proxy_id],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+        .await?
     }
 
     /// Inserts or replaces a downstream API-key configuration row.
@@ -525,6 +591,39 @@ impl ControlDb {
                 removed += stmt.execute([access_token])? as u64;
             }
             Ok(removed)
+        })
+        .await?
+    }
+
+    /// Resolves one account group into its member account names.
+    pub async fn get_account_group_account_names(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let path = self.path.clone();
+        let group_id = group_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<String>>> {
+            let conn = Connection::open(path)?;
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM account_groups WHERE id = ?1 LIMIT 1",
+                    [&group_id],
+                    |_| Ok(()),
+                )
+                .map(|_| true)
+                .or_else(|err| match err {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                    other => Err(other),
+                })?;
+            if !exists {
+                return Ok(None);
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT account_name FROM account_group_members WHERE group_id = ?1 ORDER BY account_name ASC",
+            )?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+            Ok(Some(rows.collect::<std::result::Result<Vec<_>, _>>()?))
         })
         .await?
     }

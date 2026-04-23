@@ -255,3 +255,25 @@ async fn admin_key_lifecycle_supports_create_patch_rotate_and_delete() {
         .expect("router response");
     assert_eq!(delete.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn admin_proxy_config_lifecycle_supports_create_patch_check_and_delete() {
+    let (_temp, app) = build_test_app("secret").await;
+
+    let create = send_json(
+        app.clone(),
+        Method::POST,
+        "/admin/proxy-configs",
+        "secret",
+        json!({
+            "name": "proxy-one",
+            "proxy_url": "http://127.0.0.1:11118",
+            "proxy_username": "alice",
+            "proxy_password": "pw",
+            "status": "active"
+        }),
+    )
+    .await;
+
+    assert_eq!(create.status(), StatusCode::OK);
+}

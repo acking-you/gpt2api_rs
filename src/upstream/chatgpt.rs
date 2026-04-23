@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{FixedOffset, Utc};
 use primp::{
@@ -16,10 +16,13 @@ use serde_json::{json, Value};
 use sha3::{Digest, Sha3_512};
 use uuid::Uuid;
 
-use crate::models::{AccountMetadata, AccountRecord, BrowserProfile};
+use crate::{
+    models::{AccountMetadata, AccountRecord, BrowserProfile},
+    service::{ImageEditInput, ResolvedAccountProxy},
+};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com";
-const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:11111";
+const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:11118";
 const DEFAULT_USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
     "AppleWebKit/537.36 (KHTML, like Gecko) ",
@@ -102,6 +105,15 @@ pub struct ChatgptTextStream {
     pub resolved_model: String,
 }
 
+/// Session-derived credential refresh result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshedSessionCredentials {
+    /// Fresh upstream bearer token returned by the session endpoint.
+    pub access_token: String,
+    /// Rotated session cookie if the upstream sent one back.
+    pub session_token: Option<String>,
+}
+
 /// ChatGPT Web transport root configuration.
 #[derive(Debug, Clone)]
 pub struct ChatgptUpstreamClient {
@@ -159,10 +171,72 @@ impl ChatgptUpstreamClient {
         Self { base_url: base_url.into(), proxy_url }
     }
 
-    /// Fetches account metadata from `/backend-api/me` and `/backend-api/conversation/init`.
-    pub async fn fetch_account_metadata(&self, account: &AccountRecord) -> Result<AccountMetadata> {
+    /// Returns the service-wide default upstream proxy URL used by `inherit`.
+    #[must_use]
+    pub(crate) fn default_proxy_url(&self) -> Option<String> {
+        self.proxy_url.clone()
+    }
+
+    /// Returns the configured upstream base URL.
+    #[must_use]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Refreshes one account access token from the persisted ChatGPT session cookie.
+    pub(crate) async fn refresh_session_access_token(
+        &self,
+        account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
+    ) -> Result<RefreshedSessionCredentials> {
         let profile = account.browser_profile();
-        let client = self.build_client(&profile)?;
+        let session_token = profile
+            .session_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("account does not have a session_token"))?;
+        let client = self.build_client(&profile, resolved_proxy)?;
+        let url = format!("{}/api/auth/session", self.base_url.trim_end_matches('/'));
+        let response = self
+            .apply_cookie(
+                client
+                    .get(&url)
+                    .headers(self.base_headers(&profile, None))
+                    .header("accept", "application/json"),
+                &profile,
+            )
+            .send()
+            .await
+            .context("request /api/auth/session failed")?;
+        let status = response.status();
+        let rotated_session_token = extract_session_token_cookie(&response);
+        let body = response.text().await.context("read /api/auth/session body failed")?;
+        if !status.is_success() {
+            bail!("/api/auth/session failed: HTTP {status}");
+        }
+        let value: Value = serde_json::from_str(&body).context("invalid /api/auth/session JSON")?;
+        let access_token = value
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("/api/auth/session missing accessToken"))?
+            .to_string();
+        let session_token = rotated_session_token
+            .or_else(|| Some(session_token.to_string()))
+            .filter(|value| !value.trim().is_empty());
+        Ok(RefreshedSessionCredentials { access_token, session_token })
+    }
+
+    /// Fetches account metadata from `/backend-api/me` and `/backend-api/conversation/init`.
+    pub(crate) async fn fetch_account_metadata(
+        &self,
+        account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
+    ) -> Result<AccountMetadata> {
+        let profile = account.browser_profile();
+        let client = self.build_client(&profile, resolved_proxy)?;
         let me_url = format!("{}/backend-api/me", self.base_url.trim_end_matches('/'));
         let init_url =
             format!("{}/backend-api/conversation/init", self.base_url.trim_end_matches('/'));
@@ -237,42 +311,45 @@ impl ChatgptUpstreamClient {
     }
 
     /// Executes one text-to-image request against ChatGPT Web.
-    pub async fn generate_image(
+    pub(crate) async fn generate_image(
         &self,
         account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
         prompt: &str,
         requested_model: &str,
     ) -> Result<ChatgptImageResult> {
-        self.generate_image_inner(account, prompt, requested_model, None).await
+        self.generate_image_inner(account, resolved_proxy, prompt, requested_model, None).await
     }
 
     /// Executes one image-edit request against ChatGPT Web.
-    pub async fn edit_image(
+    pub(crate) async fn edit_image(
         &self,
         account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
         prompt: &str,
         requested_model: &str,
-        image_data: &[u8],
-        file_name: &str,
-        mime_type: &str,
+        image: &ImageEditInput,
     ) -> Result<ChatgptImageResult> {
         self.generate_image_inner(
             account,
+            resolved_proxy,
             prompt,
             requested_model,
-            Some((image_data, file_name, mime_type)),
+            Some((image.image_data.as_slice(), image.file_name.as_str(), image.mime_type.as_str())),
         )
         .await
     }
 
     /// Executes one text completion request against ChatGPT Web and buffers the full SSE body.
-    pub async fn complete_text(
+    pub(crate) async fn complete_text(
         &self,
         account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
         prompt: &str,
         requested_model: &str,
     ) -> Result<ChatgptTextResult> {
-        let stream = self.start_text_stream(account, prompt, requested_model).await?;
+        let stream =
+            self.start_text_stream(account, resolved_proxy, prompt, requested_model).await?;
         let body = stream.response.text().await.context("conversation body read failed")?;
         let parsed = parse_text_sse_payload(&body);
         let text = parsed.text.trim().to_string();
@@ -287,9 +364,10 @@ impl ChatgptUpstreamClient {
     }
 
     /// Opens one text completion stream against ChatGPT Web and returns the raw SSE response.
-    pub async fn start_text_stream(
+    pub(crate) async fn start_text_stream(
         &self,
         account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
         prompt: &str,
         requested_model: &str,
     ) -> Result<ChatgptTextStream> {
@@ -298,7 +376,7 @@ impl ChatgptUpstreamClient {
             bail!("prompt is required");
         }
         let profile = account.browser_profile();
-        let client = self.build_client(&profile)?;
+        let client = self.build_client(&profile, resolved_proxy)?;
         let resolved_model = resolve_text_model(account, requested_model);
         let bootstrap = self.bootstrap(&client, &profile).await?;
         let request = UpstreamRequestContext {
@@ -336,7 +414,11 @@ impl ChatgptUpstreamClient {
         Ok(ChatgptTextStream { created: unix_timestamp_secs(), response, resolved_model })
     }
 
-    fn build_client(&self, profile: &BrowserProfile) -> Result<Client> {
+    fn build_client(
+        &self,
+        profile: &BrowserProfile,
+        resolved_proxy: &ResolvedAccountProxy,
+    ) -> Result<Client> {
         let mut builder = Client::builder()
             .impersonate(resolve_impersonate(profile))
             .impersonate_os(ImpersonateOS::Windows)
@@ -345,8 +427,11 @@ impl ChatgptUpstreamClient {
             .timeout(Duration::from_secs(180))
             .connect_timeout(Duration::from_secs(30))
             .user_agent(profile.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT));
-        if let Some(proxy_url) = self.proxy_url.as_deref().filter(|value| !value.trim().is_empty())
-        {
+        if let Some(proxy_url) = render_proxy_url(
+            resolved_proxy.proxy_url.as_deref(),
+            resolved_proxy.proxy_username.as_deref(),
+            resolved_proxy.proxy_password.as_deref(),
+        )? {
             builder = builder.proxy(Proxy::all(proxy_url).context("invalid upstream proxy URL")?);
         }
         builder.build().context("build upstream client failed")
@@ -412,6 +497,7 @@ impl ChatgptUpstreamClient {
     async fn generate_image_inner(
         &self,
         account: &AccountRecord,
+        resolved_proxy: &ResolvedAccountProxy,
         prompt: &str,
         requested_model: &str,
         edit_input: Option<(&[u8], &str, &str)>,
@@ -421,7 +507,7 @@ impl ChatgptUpstreamClient {
             bail!("prompt is required");
         }
         let profile = account.browser_profile();
-        let client = self.build_client(&profile)?;
+        let client = self.build_client(&profile, resolved_proxy)?;
         let resolved_model = resolve_upstream_model(account, requested_model);
         let bootstrap = self.bootstrap(&client, &profile).await?;
         let request = UpstreamRequestContext {
@@ -1018,6 +1104,16 @@ pub fn is_token_invalid_error(message: &str) -> bool {
         || text.contains("/backend-api/me failed: http 401")
 }
 
+/// Returns the JWT expiry timestamp embedded in one ChatGPT access token.
+#[must_use]
+pub(crate) fn access_token_expires_at(access_token: &str) -> Option<i64> {
+    decode_jwt_payload(access_token).and_then(|payload| {
+        payload.get("exp").and_then(Value::as_i64).or_else(|| {
+            payload.get("exp").and_then(Value::as_u64).and_then(|value| i64::try_from(value).ok())
+        })
+    })
+}
+
 /// Parsed highlights extracted from a ChatGPT conversation SSE stream.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ParsedConversationSse {
@@ -1027,6 +1123,24 @@ pub struct ParsedConversationSse {
     pub file_ids: Vec<String>,
     /// Aggregated assistant text parts observed in the stream.
     pub text: String,
+}
+
+fn render_proxy_url(
+    proxy_url: Option<&str>,
+    proxy_username: Option<&str>,
+    proxy_password: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let mut url = reqwest::Url::parse(proxy_url).context("invalid upstream proxy URL")?;
+    if let Some(username) = proxy_username.map(str::trim).filter(|value| !value.is_empty()) {
+        url.set_username(username).map_err(|_| anyhow!("invalid proxy username"))?;
+    }
+    if let Some(password) = proxy_password.map(str::trim).filter(|value| !value.is_empty()) {
+        url.set_password(Some(password)).map_err(|_| anyhow!("invalid proxy password"))?;
+    }
+    Ok(Some(url.to_string()))
 }
 
 fn resolve_impersonate(profile: &BrowserProfile) -> Impersonate {
@@ -1051,6 +1165,15 @@ fn find_image_limit(init: &Value) -> Option<&Value> {
             item.get("feature_name").and_then(Value::as_str) == Some(IMAGE_REQUIREMENT_FEATURE)
         })
     })
+}
+
+fn extract_session_token_cookie(response: &primp::Response) -> Option<String> {
+    response
+        .cookies()
+        .find(|cookie| {
+            matches!(cookie.name(), "__Secure-next-auth.session-token" | "next-auth.session-token")
+        })
+        .map(|cookie| cookie.value().to_string())
 }
 
 fn extract_plan_type(access_token: &str, me: &Value, init: &Value) -> Option<String> {

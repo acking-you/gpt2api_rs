@@ -1,7 +1,7 @@
 //! Parser tests for supported account import payloads.
 
 use gpt2api_rs::accounts::import::{
-    derive_account_name, extract_cpa_access_token, extract_session_access_token,
+    derive_account_name, extract_cpa_access_token, extract_session_access_token, parse_session_seed,
 };
 use gpt2api_rs::config::ResolvedPaths;
 use gpt2api_rs::models::{AccountRecord, AccountSourceKind};
@@ -14,6 +14,15 @@ use tempfile::tempdir;
 fn extract_session_json_access_token() {
     let raw = r#"{"user":{"id":"u_1"},"accessToken":"sess_token_123"}"#;
     assert_eq!(extract_session_access_token(raw).unwrap(), "sess_token_123");
+}
+
+/// Preserves `sessionToken` when an operator pastes the full ChatGPT session JSON.
+#[test]
+fn parse_session_json_preserves_session_token() {
+    let raw = r#"{"accessToken":"sess_token_123","sessionToken":"cookie_456"}"#;
+    let seed = parse_session_seed(raw).expect("session seed");
+    assert_eq!(seed.browser_profile.session_token.as_deref(), Some("cookie_456"));
+    assert_eq!(seed.source_kind, AccountSourceKind::SessionJson);
 }
 
 /// Accepts both snake_case and camelCase CPA access token aliases.
@@ -60,6 +69,8 @@ async fn upsert_account_persists_imported_account() {
         fail_count: 0,
         request_max_concurrency: Some(2),
         request_min_start_interval_ms: Some(500),
+        proxy_mode: gpt2api_rs::models::AccountProxyMode::Inherit,
+        proxy_config_id: None,
         browser_profile_json: "{}".to_string(),
     };
 

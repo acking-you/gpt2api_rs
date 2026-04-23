@@ -35,6 +35,6 @@ async fn successful_generation_updates_key_and_enqueues_outbox() {
         storage.control.get_api_key("key_1").await.expect("api key fetch").expect("api key exists");
     let outbox = storage.control.list_pending_outbox().await.expect("list outbox");
 
-    assert_eq!(key.quota_used_images, 2);
+    assert_eq!(key.quota_used_calls, 2);
     assert_eq!(outbox.len(), 1);
 }

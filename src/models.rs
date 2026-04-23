@@ -130,12 +130,17 @@ pub struct ApiKeyRecord {
     pub name: String,
     /// Stored secret hash for the downstream key.
     pub secret_hash: String,
+    /// Stored plaintext secret for admin visibility and direct reuse.
+    #[serde(default)]
+    pub secret_plaintext: Option<String>,
     /// Current key status.
     pub status: String,
-    /// Maximum billable image quota assigned to the key.
-    pub quota_total_images: i64,
-    /// Already consumed billable images.
-    pub quota_used_images: i64,
+    /// Maximum billable call quota assigned to the key.
+    #[serde(alias = "quota_total_images")]
+    pub quota_total_calls: i64,
+    /// Already consumed billable calls.
+    #[serde(alias = "quota_used_images")]
+    pub quota_used_calls: i64,
     /// Route strategy string stored in SQLite.
     pub route_strategy: String,
     /// Optional bound account-group id.
@@ -149,14 +154,15 @@ pub struct ApiKeyRecord {
 impl ApiKeyRecord {
     /// Builds a minimal active API-key record for tests.
     #[must_use]
-    pub fn minimal(id: &str, name: &str, quota_total_images: i64) -> Self {
+    pub fn minimal(id: &str, name: &str, quota_total_calls: i64) -> Self {
         Self {
             id: id.to_string(),
             name: name.to_string(),
             secret_hash: "hash".to_string(),
+            secret_plaintext: None,
             status: "active".to_string(),
-            quota_total_images,
-            quota_used_images: 0,
+            quota_total_calls,
+            quota_used_calls: 0,
             route_strategy: "auto".to_string(),
             account_group_id: None,
             request_max_concurrency: None,

@@ -45,9 +45,10 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             id TEXT PRIMARY KEY NOT NULL,
             name TEXT NOT NULL,
             secret_hash TEXT NOT NULL,
+            secret_plaintext TEXT,
             status TEXT NOT NULL,
-            quota_total_images INTEGER NOT NULL,
-            quota_used_images INTEGER NOT NULL DEFAULT 0,
+            quota_total_calls INTEGER NOT NULL,
+            quota_used_calls INTEGER NOT NULL DEFAULT 0,
             route_strategy TEXT NOT NULL,
             account_group_id TEXT,
             request_max_concurrency INTEGER,
@@ -79,6 +80,8 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
         "quota_known",
         "ALTER TABLE accounts ADD COLUMN quota_known INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_api_key_call_quota_columns(conn)?;
+    ensure_api_key_secret_plaintext_column(conn)?;
     Ok(())
 }
 
@@ -111,12 +114,117 @@ pub fn bootstrap_event_schema(conn: &DuckConnection) -> Result<()> {
 }
 
 fn ensure_account_column(conn: &SqliteConnection, column_name: &str, ddl: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(accounts)")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    let columns = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let columns = table_columns(conn, "accounts")?;
     if columns.iter().any(|column| column == column_name) {
         return Ok(());
     }
     conn.execute_batch(ddl)?;
+    Ok(())
+}
+
+fn ensure_api_key_call_quota_columns(conn: &SqliteConnection) -> Result<()> {
+    let columns = table_columns(conn, "api_keys")?;
+    let has_total_calls = columns.iter().any(|column| column == "quota_total_calls");
+    let has_used_calls = columns.iter().any(|column| column == "quota_used_calls");
+    let has_total_images = columns.iter().any(|column| column == "quota_total_images");
+    let has_used_images = columns.iter().any(|column| column == "quota_used_images");
+
+    if !has_total_calls {
+        conn.execute_batch(
+            "ALTER TABLE api_keys ADD COLUMN quota_total_calls INTEGER NOT NULL DEFAULT 0",
+        )?;
+        if has_total_images {
+            conn.execute_batch(
+                "UPDATE api_keys SET quota_total_calls = quota_total_images WHERE quota_total_calls = 0",
+            )?;
+        }
+    }
+    if !has_used_calls {
+        conn.execute_batch(
+            "ALTER TABLE api_keys ADD COLUMN quota_used_calls INTEGER NOT NULL DEFAULT 0",
+        )?;
+        if has_used_images {
+            conn.execute_batch(
+                "UPDATE api_keys SET quota_used_calls = quota_used_images WHERE quota_used_calls = 0",
+            )?;
+        }
+    }
+    if has_total_images || has_used_images {
+        rebuild_api_keys_table(conn)?;
+    }
+    Ok(())
+}
+
+fn ensure_api_key_secret_plaintext_column(conn: &SqliteConnection) -> Result<()> {
+    let columns = table_columns(conn, "api_keys")?;
+    if columns.iter().any(|column| column == "secret_plaintext") {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE api_keys ADD COLUMN secret_plaintext TEXT")?;
+    Ok(())
+}
+
+fn table_columns(conn: &SqliteConnection, table_name: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
+    let columns = table_columns(conn, "api_keys")?;
+    let select_secret_plaintext = if columns.iter().any(|column| column == "secret_plaintext") {
+        "secret_plaintext"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        r#"
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS api_keys__new;
+        CREATE TABLE api_keys__new (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            secret_hash TEXT NOT NULL,
+            secret_plaintext TEXT,
+            status TEXT NOT NULL,
+            quota_total_calls INTEGER NOT NULL,
+            quota_used_calls INTEGER NOT NULL DEFAULT 0,
+            route_strategy TEXT NOT NULL,
+            account_group_id TEXT,
+            request_max_concurrency INTEGER,
+            request_min_start_interval_ms INTEGER
+        );
+        INSERT INTO api_keys__new (
+            id,
+            name,
+            secret_hash,
+            secret_plaintext,
+            status,
+            quota_total_calls,
+            quota_used_calls,
+            route_strategy,
+            account_group_id,
+            request_max_concurrency,
+            request_min_start_interval_ms
+        )
+        SELECT
+            id,
+            name,
+            secret_hash,
+            {select_secret_plaintext},
+            status,
+            quota_total_calls,
+            quota_used_calls,
+            route_strategy,
+            account_group_id,
+            request_max_concurrency,
+            request_min_start_interval_ms
+        FROM api_keys;
+        DROP TABLE api_keys;
+        ALTER TABLE api_keys__new RENAME TO api_keys;
+        COMMIT;
+        "#,
+    );
+    conn.execute_batch(&sql)?;
     Ok(())
 }

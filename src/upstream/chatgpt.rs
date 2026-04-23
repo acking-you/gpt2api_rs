@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::models::{AccountMetadata, AccountRecord, BrowserProfile};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com";
-const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:11118";
+const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:11111";
 const DEFAULT_USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
     "AppleWebKit/537.36 (KHTML, like Gecko) ",
@@ -76,6 +76,28 @@ pub struct ChatgptImageResult {
     pub created: i64,
     /// Downloaded image payloads.
     pub data: Vec<GeneratedImageItem>,
+    /// Upstream model actually sent to ChatGPT Web.
+    pub resolved_model: String,
+}
+
+/// Successful upstream text completion result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatgptTextResult {
+    /// Unix timestamp in seconds.
+    pub created: i64,
+    /// Final assistant text.
+    pub text: String,
+    /// Upstream model actually sent to ChatGPT Web.
+    pub resolved_model: String,
+}
+
+/// Streaming upstream text completion response.
+#[derive(Debug)]
+pub struct ChatgptTextStream {
+    /// Unix timestamp in seconds.
+    pub created: i64,
+    /// Open ChatGPT SSE response body.
+    pub response: primp::Response,
     /// Upstream model actually sent to ChatGPT Web.
     pub resolved_model: String,
 }
@@ -241,6 +263,77 @@ impl ChatgptUpstreamClient {
             Some((image_data, file_name, mime_type)),
         )
         .await
+    }
+
+    /// Executes one text completion request against ChatGPT Web and buffers the full SSE body.
+    pub async fn complete_text(
+        &self,
+        account: &AccountRecord,
+        prompt: &str,
+        requested_model: &str,
+    ) -> Result<ChatgptTextResult> {
+        let stream = self.start_text_stream(account, prompt, requested_model).await?;
+        let body = stream.response.text().await.context("conversation body read failed")?;
+        let parsed = parse_text_sse_payload(&body);
+        let text = parsed.text.trim().to_string();
+        if text.is_empty() {
+            bail!("empty chat completion");
+        }
+        Ok(ChatgptTextResult {
+            created: stream.created,
+            text,
+            resolved_model: stream.resolved_model,
+        })
+    }
+
+    /// Opens one text completion stream against ChatGPT Web and returns the raw SSE response.
+    pub async fn start_text_stream(
+        &self,
+        account: &AccountRecord,
+        prompt: &str,
+        requested_model: &str,
+    ) -> Result<ChatgptTextStream> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            bail!("prompt is required");
+        }
+        let profile = account.browser_profile();
+        let client = self.build_client(&profile)?;
+        let resolved_model = resolve_text_model(account, requested_model);
+        let bootstrap = self.bootstrap(&client, &profile).await?;
+        let request = UpstreamRequestContext {
+            client: &client,
+            profile: &profile,
+            access_token: &account.access_token,
+            device_id: &bootstrap.device_id,
+        };
+        let chat_requirements = self.chat_requirements(request, &bootstrap).await?;
+        let proof_token = match chat_requirements
+            .get("proofofwork")
+            .and_then(Value::as_object)
+            .filter(|value| value.get("required").and_then(Value::as_bool).unwrap_or(false))
+        {
+            Some(pow) => Some(generate_proof_token(
+                pow.get("seed").and_then(Value::as_str).unwrap_or_default(),
+                pow.get("difficulty").and_then(Value::as_str).unwrap_or_default(),
+                &build_pow_config(
+                    profile.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT),
+                    &bootstrap.scripts,
+                    bootstrap.build_id.as_deref(),
+                ),
+            )),
+            None => None,
+        };
+        let response = self
+            .send_text_conversation_response(
+                request,
+                chat_requirements.get("token").and_then(Value::as_str).unwrap_or_default(),
+                proof_token.as_deref(),
+                prompt,
+                &resolved_model,
+            )
+            .await?;
+        Ok(ChatgptTextStream { created: unix_timestamp_secs(), response, resolved_model })
     }
 
     fn build_client(&self, profile: &BrowserProfile) -> Result<Client> {
@@ -639,6 +732,86 @@ impl ChatgptUpstreamClient {
             );
         }
         Ok(body)
+    }
+
+    async fn send_text_conversation_response(
+        &self,
+        request: UpstreamRequestContext<'_>,
+        chat_token: &str,
+        proof_token: Option<&str>,
+        prompt: &str,
+        model: &str,
+    ) -> Result<primp::Response> {
+        let url = format!("{}/backend-api/conversation", self.base_url.trim_end_matches('/'));
+        let mut headers = self.base_headers(request.profile, Some(request.device_id));
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("oai-language", HeaderValue::from_static("zh-CN"));
+        headers.insert(
+            HeaderName::from_static("oai-client-build-number"),
+            HeaderValue::from_static(CLIENT_BUILD_NUMBER),
+        );
+        headers.insert(
+            HeaderName::from_static("oai-client-version"),
+            HeaderValue::from_static(CLIENT_VERSION),
+        );
+        headers.insert(
+            HeaderName::from_static("openai-sentinel-chat-requirements-token"),
+            HeaderValue::from_str(chat_token).context("invalid chat requirements token header")?,
+        );
+        if let Some(proof_token) = proof_token.filter(|value| !value.is_empty()) {
+            headers.insert(
+                HeaderName::from_static("openai-sentinel-proof-token"),
+                HeaderValue::from_str(proof_token).context("invalid proof token header")?,
+            );
+        }
+        let response = self
+            .apply_cookie(
+                request.client.post(&url).bearer_auth(request.access_token).headers(headers).json(
+                    &json!({
+                        "action": "next",
+                        "messages": [{
+                            "id": Uuid::new_v4().to_string(),
+                            "author": {"role": "user"},
+                            "content": {"content_type": "text", "parts": [prompt]},
+                            "metadata": {"attachments": []},
+                        }],
+                        "parent_message_id": Uuid::new_v4().to_string(),
+                        "model": model,
+                        "history_and_training_disabled": false,
+                        "timezone_offset_min": -480,
+                        "timezone": "America/Los_Angeles",
+                        "conversation_mode": {"kind": "primary_assistant"},
+                        "conversation_origin": Value::Null,
+                        "force_paragen": false,
+                        "force_paragen_model_slug": "",
+                        "force_rate_limit": false,
+                        "force_use_sse": true,
+                        "paragen_cot_summary_display_override": "allow",
+                        "paragen_stream_type_override": Value::Null,
+                        "reset_rate_limits": false,
+                        "suggestions": [],
+                        "supported_encodings": [],
+                        "system_hints": [],
+                        "variant_purpose": "none",
+                        "websocket_request_id": Uuid::new_v4().to_string(),
+                        "client_contextual_info": build_client_contextual_info(),
+                    }),
+                ),
+                request.profile,
+            )
+            .send()
+            .await
+            .context("text conversation request failed")?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let status = response.status();
+        let body = response.text().await.context("text conversation body read failed")?;
+        bail!(
+            "{}",
+            truncate_message(&body, format!("conversation failed: HTTP {status}").as_str())
+        );
     }
 
     async fn send_edit_conversation(
@@ -1088,6 +1261,31 @@ fn parse_sse_payload(raw: &str) -> ParsedConversationSse {
     parsed
 }
 
+fn parse_text_sse_payload(raw: &str) -> ParsedConversationSse {
+    let mut parsed = ParsedConversationSse::default();
+    for line in raw.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let payload = line.trim_start_matches("data:").trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        if parsed.conversation_id.is_empty() {
+            parsed.conversation_id =
+                extract_conversation_id(&value).unwrap_or_default().to_string();
+        }
+        if let Some(text) = extract_assistant_text_snapshot(&value) {
+            parsed.text = text;
+        }
+    }
+    parsed
+}
+
 /// Parses the conversation SSE response and extracts file-service ids.
 #[must_use]
 pub fn parse_conversation_sse(raw: &str) -> ParsedConversationSse {
@@ -1113,6 +1311,61 @@ fn extract_inline_file_ids(payload: &str, file_ids: &mut Vec<String>) {
             start = begin;
         }
     }
+}
+
+fn extract_conversation_id(value: &Value) -> Option<&str> {
+    value.get("conversation_id").and_then(Value::as_str).or_else(|| {
+        value.get("v").and_then(|inner| inner.get("conversation_id")).and_then(Value::as_str)
+    })
+}
+
+fn extract_assistant_text_snapshot(value: &Value) -> Option<String> {
+    for message in [value.get("message"), value.get("v").and_then(|inner| inner.get("message"))] {
+        let Some(message) = message.and_then(Value::as_object) else {
+            continue;
+        };
+        if message
+            .get("author")
+            .and_then(Value::as_object)
+            .and_then(|author| author.get("role"))
+            .and_then(Value::as_str)
+            != Some("assistant")
+        {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_object) else {
+            continue;
+        };
+        match content.get("content_type").and_then(Value::as_str).unwrap_or_default() {
+            "text" | "multimodal_text" => {
+                let text = content
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                Value::String(text) => Some(text.trim().to_string()),
+                                Value::Object(object) => object
+                                    .get("text")
+                                    .or_else(|| object.get("content"))
+                                    .and_then(Value::as_str)
+                                    .map(|text| text.trim().to_string()),
+                                _ => None,
+                            })
+                            .filter(|text| !text.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn extract_image_ids(mapping: &Value) -> Vec<String> {
@@ -1221,6 +1474,18 @@ fn resolve_upstream_model(account: &AccountRecord, requested_model: &str) -> Str
     if requested_model == "gpt-image-2" {
         let free = account.plan_type.as_deref().unwrap_or("free").eq_ignore_ascii_case("free");
         return if free { "auto".to_string() } else { "gpt-5-3".to_string() };
+    }
+    requested_model.to_string()
+}
+
+fn resolve_text_model(account: &AccountRecord, requested_model: &str) -> String {
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() || requested_model.eq_ignore_ascii_case("auto") {
+        return account
+            .default_model_slug
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "auto".to_string());
     }
     requested_model.to_string()
 }

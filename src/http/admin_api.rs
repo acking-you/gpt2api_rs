@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     Json,
 };
@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 use crate::{
     error::AppError,
     models::{AccountRecord, ApiKeyRecord, BrowserProfile, UsageEventRecord},
-    service::{AccountImportItem, AccountUpdate, AppService},
+    service::{
+        AccountImportItem, AccountUpdate, ApiKeyCreate, ApiKeySecretRecord, ApiKeyUpdate,
+        AppService,
+    },
 };
 
 /// Query parameters supported by the usage listing endpoint.
@@ -76,6 +79,56 @@ pub struct UpdateAccountRequest {
     request_max_concurrency: Option<u64>,
     /// Optional replacement account-level minimum start interval.
     request_min_start_interval_ms: Option<u64>,
+}
+
+/// Request body for creating one downstream API key.
+#[derive(Debug, Deserialize)]
+pub struct CreateKeyRequest {
+    /// Human-readable key label.
+    name: String,
+    /// Maximum billable call quota assigned to the key.
+    quota_total_calls: i64,
+    /// Optional replacement status. Defaults to `active`.
+    #[serde(default)]
+    status: Option<String>,
+    /// Stored route strategy. Defaults to `auto`.
+    #[serde(default = "default_route_strategy")]
+    route_strategy: String,
+    /// Optional bound account-group id.
+    #[serde(default)]
+    account_group_id: Option<String>,
+    /// Optional per-key concurrency cap.
+    #[serde(default)]
+    request_max_concurrency: Option<u64>,
+    /// Optional per-key minimum start interval in milliseconds.
+    #[serde(default)]
+    request_min_start_interval_ms: Option<u64>,
+}
+
+/// Request body for updating one downstream API key.
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateKeyRequest {
+    /// Optional replacement key label.
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional replacement key status.
+    #[serde(default)]
+    status: Option<String>,
+    /// Optional replacement total call quota.
+    #[serde(default)]
+    quota_total_calls: Option<i64>,
+    /// Optional replacement route strategy.
+    #[serde(default)]
+    route_strategy: Option<String>,
+    /// Optional replacement account-group id. `null` clears the field.
+    #[serde(default)]
+    account_group_id: Option<Option<String>>,
+    /// Optional replacement concurrency cap. `null` clears the field.
+    #[serde(default)]
+    request_max_concurrency: Option<Option<u64>>,
+    /// Optional replacement minimum start interval. `null` clears the field.
+    #[serde(default)]
+    request_min_start_interval_ms: Option<Option<u64>>,
 }
 
 /// Returns a minimal operational snapshot for the admin control plane.
@@ -225,6 +278,83 @@ pub async fn list_keys(
     Ok(Json(keys))
 }
 
+/// Creates one downstream API key and returns the stored plaintext secret.
+pub async fn create_key(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateKeyRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    let created = service
+        .create_api_key(&ApiKeyCreate {
+            name: body.name,
+            quota_total_calls: body.quota_total_calls,
+            status: body.status,
+            route_strategy: body.route_strategy,
+            account_group_id: body.account_group_id,
+            request_max_concurrency: body.request_max_concurrency,
+            request_min_start_interval_ms: body.request_min_start_interval_ms,
+        })
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(serialize_key_record(&created, true)))
+}
+
+/// Updates one downstream API key.
+pub async fn update_key(
+    Path(key_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateKeyRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    let Some(key) = service
+        .update_api_key(
+            &key_id,
+            &ApiKeyUpdate {
+                name: body.name,
+                status: body.status,
+                quota_total_calls: body.quota_total_calls,
+                route_strategy: body.route_strategy,
+                account_group_id: body.account_group_id,
+                request_max_concurrency: body.request_max_concurrency,
+                request_min_start_interval_ms: body.request_min_start_interval_ms,
+            },
+        )
+        .await
+        .map_err(AppError::internal)?
+    else {
+        return Err(AppError::not_found("key not found"));
+    };
+    Ok(Json(serialize_key(&key, None)))
+}
+
+/// Rotates one downstream API key and returns the stored plaintext secret.
+pub async fn rotate_key(
+    Path(key_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    let Some(rotated) = service.rotate_api_key(&key_id).await.map_err(AppError::internal)? else {
+        return Err(AppError::not_found("key not found"));
+    };
+    Ok(Json(serialize_key_record(&rotated, true)))
+}
+
+/// Deletes one downstream API key.
+pub async fn delete_key(
+    Path(key_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    if !service.delete_api_key(&key_id).await.map_err(AppError::internal)? {
+        return Err(AppError::not_found("key not found"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// Lists recent usage-event summaries.
 pub async fn list_usage(
     Query(query): Query<UsageQuery>,
@@ -253,4 +383,29 @@ fn require_admin(headers: &HeaderMap, service: &Arc<AppService>) -> Result<(), A
     } else {
         Err(AppError::with_status(StatusCode::UNAUTHORIZED, "authorization is invalid"))
     }
+}
+
+fn default_route_strategy() -> String {
+    "auto".to_string()
+}
+
+fn serialize_key_record(record: &ApiKeySecretRecord, include_secret: bool) -> Value {
+    serialize_key(&record.key, include_secret.then_some(record.secret_plaintext.as_str()))
+}
+
+fn serialize_key(key: &ApiKeyRecord, secret_plaintext: Option<&str>) -> Value {
+    let secret_plaintext = secret_plaintext.or(key.secret_plaintext.as_deref());
+    json!({
+        "id": key.id,
+        "name": key.name,
+        "secret_hash": key.secret_hash,
+        "status": key.status,
+        "quota_total_calls": key.quota_total_calls,
+        "quota_used_calls": key.quota_used_calls,
+        "route_strategy": key.route_strategy,
+        "account_group_id": key.account_group_id,
+        "request_max_concurrency": key.request_max_concurrency,
+        "request_min_start_interval_ms": key.request_min_start_interval_ms,
+        "secret_plaintext": secret_plaintext,
+    })
 }

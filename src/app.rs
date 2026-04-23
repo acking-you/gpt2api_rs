@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 
@@ -17,7 +17,7 @@ pub fn build_router(service: Arc<AppService>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(public_api::version))
-        .route("/auth/login", post(public_api::login))
+        .route("/auth/login", get(public_api::login).post(public_api::login))
         .route("/v1/models", get(public_api::list_models))
         .route("/v1/images/generations", post(public_api::generate_images))
         .route("/v1/images/edits", post(public_api::edit_images))
@@ -28,7 +28,9 @@ pub fn build_router(service: Arc<AppService>) -> Router {
         .route("/admin/accounts/import", post(admin_api::import_accounts))
         .route("/admin/accounts/refresh", post(admin_api::refresh_accounts))
         .route("/admin/accounts/update", post(admin_api::update_account))
-        .route("/admin/keys", get(admin_api::list_keys))
+        .route("/admin/keys", get(admin_api::list_keys).post(admin_api::create_key))
+        .route("/admin/keys/:key_id", patch(admin_api::update_key).delete(admin_api::delete_key))
+        .route("/admin/keys/:key_id/rotate", post(admin_api::rotate_key))
         .route("/admin/usage", get(admin_api::list_usage))
         .with_state(service)
 }

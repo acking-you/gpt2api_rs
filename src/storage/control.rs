@@ -17,6 +17,22 @@ pub struct ControlDb {
     path: PathBuf,
 }
 
+fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
+    Ok(ApiKeyRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        secret_hash: row.get(2)?,
+        secret_plaintext: row.get(3)?,
+        status: row.get(4)?,
+        quota_total_calls: row.get(5)?,
+        quota_used_calls: row.get(6)?,
+        route_strategy: row.get(7)?,
+        account_group_id: row.get(8)?,
+        request_max_concurrency: row.get(9)?,
+        request_min_start_interval_ms: row.get(10)?,
+    })
+}
+
 impl ControlDb {
     /// Opens the SQLite database and bootstraps the schema.
     pub async fn open(path: PathBuf) -> Result<Self> {
@@ -298,14 +314,15 @@ impl ControlDb {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = Connection::open(path)?;
             conn.execute(
-                "INSERT OR REPLACE INTO api_keys (id, name, secret_hash, status, quota_total_images, quota_used_images, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT OR REPLACE INTO api_keys (id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     &key.id,
                     &key.name,
                     &key.secret_hash,
+                    &key.secret_plaintext,
                     &key.status,
-                    key.quota_total_images,
-                    key.quota_used_images,
+                    key.quota_total_calls,
+                    key.quota_used_calls,
                     &key.route_strategy,
                     &key.account_group_id,
                     &key.request_max_concurrency,
@@ -326,22 +343,9 @@ impl ControlDb {
         tokio::task::spawn_blocking(move || -> Result<Option<ApiKeyRecord>> {
             let conn = Connection::open(path)?;
             let mut stmt = conn.prepare(
-                "SELECT id, name, secret_hash, status, quota_total_images, quota_used_images, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys WHERE id = ?1 LIMIT 1",
+                "SELECT id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys WHERE id = ?1 LIMIT 1",
             )?;
-            let row = stmt.query_row([key_id], |row| {
-                Ok(ApiKeyRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    secret_hash: row.get(2)?,
-                    status: row.get(3)?,
-                    quota_total_images: row.get(4)?,
-                    quota_used_images: row.get(5)?,
-                    route_strategy: row.get(6)?,
-                    account_group_id: row.get(7)?,
-                    request_max_concurrency: row.get(8)?,
-                    request_min_start_interval_ms: row.get(9)?,
-                })
-            });
+            let row = stmt.query_row([key_id], api_key_from_row);
 
             match row {
                 Ok(record) => Ok(Some(record)),
@@ -362,22 +366,31 @@ impl ControlDb {
         tokio::task::spawn_blocking(move || -> Result<Option<ApiKeyRecord>> {
             let conn = Connection::open(path)?;
             let mut stmt = conn.prepare(
-                "SELECT id, name, secret_hash, status, quota_total_images, quota_used_images, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys WHERE secret_hash = ?1 LIMIT 1",
+                "SELECT id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys WHERE secret_hash = ?1 LIMIT 1",
             )?;
-            let row = stmt.query_row([secret_hash], |row| {
-                Ok(ApiKeyRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    secret_hash: row.get(2)?,
-                    status: row.get(3)?,
-                    quota_total_images: row.get(4)?,
-                    quota_used_images: row.get(5)?,
-                    route_strategy: row.get(6)?,
-                    account_group_id: row.get(7)?,
-                    request_max_concurrency: row.get(8)?,
-                    request_min_start_interval_ms: row.get(9)?,
-                })
-            });
+            let row = stmt.query_row([secret_hash], api_key_from_row);
+            match row {
+                Ok(record) => Ok(Some(record)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        })
+        .await?
+    }
+
+    /// Fetches one downstream API key by stored plaintext secret.
+    pub async fn find_api_key_by_secret_plaintext(
+        &self,
+        secret_plaintext: &str,
+    ) -> Result<Option<ApiKeyRecord>> {
+        let path = self.path.clone();
+        let secret_plaintext = secret_plaintext.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ApiKeyRecord>> {
+            let conn = Connection::open(path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys WHERE secret_plaintext = ?1 LIMIT 1",
+            )?;
+            let row = stmt.query_row([secret_plaintext], api_key_from_row);
             match row {
                 Ok(record) => Ok(Some(record)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -393,22 +406,9 @@ impl ControlDb {
         tokio::task::spawn_blocking(move || -> Result<Vec<ApiKeyRecord>> {
             let conn = Connection::open(path)?;
             let mut stmt = conn.prepare(
-                "SELECT id, name, secret_hash, status, quota_total_images, quota_used_images, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys ORDER BY id ASC",
+                "SELECT id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms FROM api_keys ORDER BY id ASC",
             )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(ApiKeyRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    secret_hash: row.get(2)?,
-                    status: row.get(3)?,
-                    quota_total_images: row.get(4)?,
-                    quota_used_images: row.get(5)?,
-                    route_strategy: row.get(6)?,
-                    account_group_id: row.get(7)?,
-                    request_max_concurrency: row.get(8)?,
-                    request_min_start_interval_ms: row.get(9)?,
-                })
-            })?;
+            let rows = stmt.query_map([], api_key_from_row)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
         .await?
@@ -422,7 +422,7 @@ impl ControlDb {
             let mut conn = Connection::open(path)?;
             let tx = conn.transaction()?;
             tx.execute(
-                "UPDATE api_keys SET quota_used_images = quota_used_images + ?2 WHERE id = ?1",
+                "UPDATE api_keys SET quota_used_calls = quota_used_calls + ?2 WHERE id = ?1",
                 params![&event.key_id, event.billable_images],
             )?;
             tx.execute(
@@ -435,6 +435,17 @@ impl ControlDb {
         .await??;
 
         Ok(())
+    }
+
+    /// Deletes one downstream API key by stable id and returns whether a row was removed.
+    pub async fn delete_api_key(&self, key_id: &str) -> Result<bool> {
+        let path = self.path.clone();
+        let key_id = key_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = Connection::open(path)?;
+            Ok(conn.execute("DELETE FROM api_keys WHERE id = ?1", params![key_id])? > 0)
+        })
+        .await?
     }
 
     /// Lists pending outbox ids that have not been flushed yet.

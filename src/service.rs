@@ -8,7 +8,8 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
-use sha1::{Digest, Sha1};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
 
@@ -18,7 +19,10 @@ use crate::{
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
     storage::Storage,
-    upstream::chatgpt::{is_token_invalid_error, ChatgptImageResult, ChatgptUpstreamClient},
+    upstream::chatgpt::{
+        is_token_invalid_error, ChatgptImageResult, ChatgptTextResult, ChatgptTextStream,
+        ChatgptUpstreamClient,
+    },
 };
 
 const DEFAULT_KEY_ID: &str = "default";
@@ -65,6 +69,78 @@ pub struct ImageEditInput {
     pub mime_type: String,
 }
 
+/// Public-key authentication failure classes exposed to downstream callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PublicAuthError {
+    /// The supplied bearer token does not match any configured key.
+    #[error("invalid_key")]
+    InvalidKey,
+    /// The key exists but is not active.
+    #[error("disabled")]
+    Disabled,
+    /// The key has no remaining call quota.
+    #[error("quota_exhausted")]
+    QuotaExhausted,
+}
+
+/// Public-key authentication result that preserves internal storage failures.
+#[derive(Debug, Error)]
+pub enum PublicAuthFailure {
+    /// Authentication failed due to key state.
+    #[error(transparent)]
+    Auth(#[from] PublicAuthError),
+    /// Authentication failed due to internal storage/runtime errors.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Mutable API-key fields allowed through the admin create surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyCreate {
+    /// Human-readable key label.
+    pub name: String,
+    /// Maximum billable call quota assigned to the key.
+    pub quota_total_calls: i64,
+    /// Optional replacement status. Defaults to `active`.
+    pub status: Option<String>,
+    /// Stored route strategy. Defaults to `auto`.
+    pub route_strategy: String,
+    /// Optional bound account-group id.
+    pub account_group_id: Option<String>,
+    /// Optional per-key concurrency cap.
+    pub request_max_concurrency: Option<u64>,
+    /// Optional per-key minimum start interval in milliseconds.
+    pub request_min_start_interval_ms: Option<u64>,
+}
+
+/// Mutable API-key fields allowed through the admin update surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiKeyUpdate {
+    /// Optional replacement key label.
+    pub name: Option<String>,
+    /// Optional replacement key status.
+    pub status: Option<String>,
+    /// Optional replacement total call quota.
+    pub quota_total_calls: Option<i64>,
+    /// Optional replacement route strategy.
+    pub route_strategy: Option<String>,
+    /// Optional replacement account-group id. `Some(None)` clears the field.
+    pub account_group_id: Option<Option<String>>,
+    /// Optional replacement concurrency cap. `Some(None)` clears the field.
+    pub request_max_concurrency: Option<Option<u64>>,
+    /// Optional replacement minimum start interval. `Some(None)` clears the field.
+    pub request_min_start_interval_ms: Option<Option<u64>>,
+}
+
+/// One admin-visible API-key record plus the stored plaintext secret.
+#[derive(Debug, Clone)]
+pub struct ApiKeySecretRecord {
+    /// Persisted API-key record after the write completed.
+    pub key: ApiKeyRecord,
+    /// Plaintext secret stored with the key and returned to the caller.
+    pub secret_plaintext: String,
+}
+
 /// Shared runtime service backing public and admin HTTP handlers.
 #[derive(Debug, Clone)]
 pub struct AppService {
@@ -106,21 +182,42 @@ impl AppService {
     }
 
     /// Authenticates one downstream public API key from a bearer token.
-    pub async fn authenticate_public_key(&self, bearer: &str) -> Result<ApiKeyRecord> {
-        let secret_hash = sha1_hex(bearer.trim());
-        let Some(key) = self.storage.control.find_api_key_by_secret_hash(&secret_hash).await?
-        else {
-            bail!("authorization is invalid");
-        };
-        if key.status != "active" {
-            bail!("authorization is invalid");
+    pub async fn authenticate_public_key(
+        &self,
+        bearer: &str,
+    ) -> std::result::Result<ApiKeyRecord, PublicAuthFailure> {
+        let bearer = bearer.trim();
+        if bearer.is_empty() {
+            return Err(PublicAuthError::InvalidKey.into());
         }
+        let expected_hash = sha256_hex(bearer);
+        let Some(mut key) = (if let Some(key) =
+            self.storage.control.find_api_key_by_secret_plaintext(bearer).await?
+        {
+            Some(key)
+        } else {
+            self.storage.control.find_api_key_by_secret_hash(&expected_hash).await?
+        }) else {
+            return Err(PublicAuthError::InvalidKey.into());
+        };
+        if key.secret_plaintext.as_deref() != Some(bearer) || key.secret_hash != expected_hash {
+            key.secret_plaintext = Some(bearer.to_string());
+            key.secret_hash = expected_hash;
+            self.storage.control.upsert_api_key(&key).await?;
+        }
+        if key.status != "active" {
+            return Err(PublicAuthError::Disabled.into());
+        }
+        ensure_key_can_consume(&key, 1)?;
         Ok(key)
     }
 
     /// Validates `/auth/login` using the public API key path.
-    pub async fn login(&self, bearer: &str) -> Result<()> {
-        self.authenticate_public_key(bearer).await.map(|_| ())
+    pub async fn login(
+        &self,
+        bearer: &str,
+    ) -> std::result::Result<ApiKeyRecord, PublicAuthFailure> {
+        self.authenticate_public_key(bearer).await
     }
 
     /// Imports accounts and returns the refreshed account list.
@@ -195,6 +292,77 @@ impl AppService {
         Ok(Some(account))
     }
 
+    /// Creates one downstream API key and returns the stored plaintext secret.
+    pub async fn create_api_key(&self, input: &ApiKeyCreate) -> Result<ApiKeySecretRecord> {
+        let secret_plaintext = generate_api_key_plaintext();
+        let key = ApiKeyRecord {
+            id: format!("key_{}", Uuid::new_v4().simple()),
+            name: normalize_required_string(&input.name, "name")?,
+            secret_hash: sha256_hex(&secret_plaintext),
+            secret_plaintext: Some(secret_plaintext.clone()),
+            status: normalize_api_key_status(input.status.as_deref().unwrap_or("active"))?,
+            quota_total_calls: validate_quota_total_calls(input.quota_total_calls)?,
+            quota_used_calls: 0,
+            route_strategy: normalize_route_strategy(&input.route_strategy)?,
+            account_group_id: normalize_optional_string(input.account_group_id.as_deref()),
+            request_max_concurrency: input.request_max_concurrency,
+            request_min_start_interval_ms: input.request_min_start_interval_ms,
+        };
+        self.storage.control.upsert_api_key(&key).await?;
+        Ok(ApiKeySecretRecord { key, secret_plaintext })
+    }
+
+    /// Updates one downstream API key and returns the stored record.
+    pub async fn update_api_key(
+        &self,
+        key_id: &str,
+        update: &ApiKeyUpdate,
+    ) -> Result<Option<ApiKeyRecord>> {
+        let Some(mut key) = self.storage.control.get_api_key(key_id).await? else {
+            return Ok(None);
+        };
+        if let Some(name) = update.name.as_deref() {
+            key.name = normalize_required_string(name, "name")?;
+        }
+        if let Some(status) = update.status.as_deref() {
+            key.status = normalize_api_key_status(status)?;
+        }
+        if let Some(quota_total_calls) = update.quota_total_calls {
+            key.quota_total_calls = validate_quota_total_calls(quota_total_calls)?;
+        }
+        if let Some(route_strategy) = update.route_strategy.as_deref() {
+            key.route_strategy = normalize_route_strategy(route_strategy)?;
+        }
+        if let Some(account_group_id) = &update.account_group_id {
+            key.account_group_id = normalize_optional_string(account_group_id.as_deref());
+        }
+        if let Some(request_max_concurrency) = update.request_max_concurrency {
+            key.request_max_concurrency = request_max_concurrency;
+        }
+        if let Some(request_min_start_interval_ms) = update.request_min_start_interval_ms {
+            key.request_min_start_interval_ms = request_min_start_interval_ms;
+        }
+        self.storage.control.upsert_api_key(&key).await?;
+        Ok(Some(key))
+    }
+
+    /// Rotates one downstream API key and returns the stored plaintext secret.
+    pub async fn rotate_api_key(&self, key_id: &str) -> Result<Option<ApiKeySecretRecord>> {
+        let Some(mut key) = self.storage.control.get_api_key(key_id).await? else {
+            return Ok(None);
+        };
+        let secret_plaintext = generate_api_key_plaintext();
+        key.secret_hash = sha256_hex(&secret_plaintext);
+        key.secret_plaintext = Some(secret_plaintext.clone());
+        self.storage.control.upsert_api_key(&key).await?;
+        Ok(Some(ApiKeySecretRecord { key, secret_plaintext }))
+    }
+
+    /// Deletes one downstream API key by stable id.
+    pub async fn delete_api_key(&self, key_id: &str) -> Result<bool> {
+        self.storage.control.delete_api_key(key_id).await
+    }
+
     /// Executes one text-to-image request and returns the downstream image payload.
     pub async fn generate_images(
         &self,
@@ -203,15 +371,11 @@ impl AppService {
         requested_model: &str,
         requested_n: usize,
     ) -> Result<ChatgptImageResult> {
-        self.execute_public_image_request(
-            bearer,
-            prompt,
-            requested_model,
-            requested_n,
-            None,
-            "/v1/images/generations",
-        )
-        .await
+        let key = self
+            .authenticate_public_key(bearer)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.generate_images_for_key(&key, prompt, requested_model, requested_n).await
     }
 
     /// Executes one image-edit request and returns the downstream image payload.
@@ -223,8 +387,43 @@ impl AppService {
         requested_n: usize,
         edit_input: ImageEditInput,
     ) -> Result<ChatgptImageResult> {
+        let key = self
+            .authenticate_public_key(bearer)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.edit_images_for_key(&key, prompt, requested_model, requested_n, edit_input).await
+    }
+
+    /// Executes one text-to-image request for an already authenticated key.
+    pub async fn generate_images_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        requested_n: usize,
+    ) -> Result<ChatgptImageResult> {
         self.execute_public_image_request(
-            bearer,
+            key,
+            prompt,
+            requested_model,
+            requested_n,
+            None,
+            "/v1/images/generations",
+        )
+        .await
+    }
+
+    /// Executes one image-edit request for an already authenticated key.
+    pub async fn edit_images_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        requested_n: usize,
+        edit_input: ImageEditInput,
+    ) -> Result<ChatgptImageResult> {
+        self.execute_public_image_request(
+            key,
             prompt,
             requested_model,
             requested_n,
@@ -232,6 +431,28 @@ impl AppService {
             "/v1/images/edits",
         )
         .await
+    }
+
+    /// Executes one non-streaming text completion for an already authenticated key.
+    pub async fn complete_text_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        endpoint: &str,
+    ) -> Result<ChatgptTextResult> {
+        self.execute_public_text_request(key, prompt, requested_model, endpoint).await
+    }
+
+    /// Opens one streaming text completion for an already authenticated key.
+    pub async fn start_text_stream_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        endpoint: &str,
+    ) -> Result<ChatgptTextStream> {
+        self.start_public_text_stream(key, prompt, requested_model, endpoint).await
     }
 
     /// Builds a chat.completions-compatible payload around the image gateway result.
@@ -273,6 +494,33 @@ impl AppService {
         })
     }
 
+    /// Builds a chat.completions-compatible payload around the text gateway result.
+    pub fn build_text_chat_completion_response(
+        &self,
+        requested_model: &str,
+        result: &ChatgptTextResult,
+    ) -> Value {
+        json!({
+            "id": format!("chatcmpl-{}", Uuid::new_v4().simple()),
+            "object": "chat.completion",
+            "created": result.created,
+            "model": response_model_name(requested_model, &result.resolved_model),
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": result.text,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        })
+    }
+
     /// Builds a responses-compatible payload around the image gateway result.
     pub fn build_responses_api_response(
         &self,
@@ -302,6 +550,36 @@ impl AppService {
             "incomplete_details": Value::Null,
             "model": requested_model,
             "output": output,
+            "parallel_tool_calls": false,
+        })
+    }
+
+    /// Builds a responses-compatible payload around the text gateway result.
+    pub fn build_text_responses_api_response(
+        &self,
+        requested_model: &str,
+        result: &ChatgptTextResult,
+    ) -> Value {
+        json!({
+            "id": format!("resp_{}", result.created),
+            "object": "response",
+            "created_at": result.created,
+            "status": "completed",
+            "error": Value::Null,
+            "incomplete_details": Value::Null,
+            "model": response_model_name(requested_model, &result.resolved_model),
+            "output": [{
+                "id": format!("msg_{}", Uuid::new_v4().simple()),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": result.text,
+                    "annotations": [],
+                }],
+            }],
+            "output_text": result.text,
             "parallel_tool_calls": false,
         })
     }
@@ -368,10 +646,11 @@ impl AppService {
         let key = ApiKeyRecord {
             id: DEFAULT_KEY_ID.to_string(),
             name: "default".to_string(),
-            secret_hash: sha1_hex(&self.admin_token),
+            secret_hash: sha256_hex(&self.admin_token),
+            secret_plaintext: Some(self.admin_token.clone()),
             status: "active".to_string(),
-            quota_total_images: i64::MAX / 4,
-            quota_used_images: 0,
+            quota_total_calls: i64::MAX / 4,
+            quota_used_calls: 0,
             route_strategy: "auto".to_string(),
             account_group_id: None,
             request_max_concurrency: None,
@@ -382,18 +661,16 @@ impl AppService {
 
     async fn execute_public_image_request(
         &self,
-        bearer: &str,
+        key: &ApiKeyRecord,
         prompt: &str,
         requested_model: &str,
         requested_n: usize,
         edit_input: Option<ImageEditInput>,
         endpoint: &str,
     ) -> Result<ChatgptImageResult> {
-        let key = self.authenticate_public_key(bearer).await?;
-        if key.quota_total_images > 0 && key.quota_used_images >= key.quota_total_images {
-            bail!("quota exceeded");
-        }
-        let key_lease = self.acquire_key_lease(&key).await?;
+        ensure_key_can_consume(key, requested_n as i64)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let key_lease = self.acquire_key_lease(key).await?;
         let _keep_key_lease = key_lease;
 
         let requested_n = requested_n.clamp(1, 4);
@@ -402,12 +679,14 @@ impl AppService {
         let mut images = Vec::new();
         let mut resolved_model = String::new();
         let mut selected_account_name = String::new();
+        let mut last_error = None;
 
         for _ in 0..requested_n {
-            let (account, lease) = self.acquire_account_for_key(&key).await?;
+            let (account, lease) = self.acquire_account_for_key(key).await?;
             let _keep_account_lease = lease;
             let account = self.refresh_account_if_needed(account).await?;
             if !is_account_routeable(&account) {
+                last_error = Some("no available accounts".to_string());
                 continue;
             }
             selected_account_name = account.name.clone();
@@ -434,6 +713,7 @@ impl AppService {
                 }
                 Err(error) => {
                     self.record_account_failure(&account, &error.to_string()).await?;
+                    last_error = Some(error.to_string());
                     if is_token_invalid_error(&error.to_string()) {
                         continue;
                     }
@@ -442,7 +722,7 @@ impl AppService {
         }
 
         if images.is_empty() {
-            bail!("image generation failed");
+            bail!(last_error.unwrap_or_else(|| "image generation failed".to_string()));
         }
 
         let result = ChatgptImageResult {
@@ -475,6 +755,132 @@ impl AppService {
         };
         self.storage.control.apply_success_settlement(&event).await?;
         Ok(result)
+    }
+
+    async fn execute_public_text_request(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        endpoint: &str,
+    ) -> Result<ChatgptTextResult> {
+        ensure_key_can_consume(key, 1).map_err(|error| anyhow!(error.to_string()))?;
+        let key_lease = self.acquire_key_lease(key).await?;
+        let _keep_key_lease = key_lease;
+
+        let request_id = Uuid::new_v4().to_string();
+        let started = Instant::now();
+        let max_attempts = self.storage.control.list_accounts().await?.len().max(1);
+        let mut last_error = None;
+
+        for _ in 0..max_attempts {
+            let (account, lease) = self.acquire_account_for_key(key).await?;
+            let _keep_account_lease = lease;
+            let account = self.refresh_account_if_needed(account).await?;
+            if !is_account_routeable(&account) {
+                last_error = Some("no available accounts".to_string());
+                continue;
+            }
+            match self.upstream.complete_text(&account, prompt, requested_model).await {
+                Ok(result) => {
+                    self.record_account_success(&account).await?;
+                    let event = UsageEventRecord {
+                        event_id: Uuid::new_v4().to_string(),
+                        request_id: request_id.clone(),
+                        key_id: key.id.clone(),
+                        key_name: key.name.clone(),
+                        account_name: account.name.clone(),
+                        endpoint: endpoint.to_string(),
+                        requested_model: requested_model.to_string(),
+                        resolved_upstream_model: result.resolved_model.clone(),
+                        requested_n: 1,
+                        generated_n: 1,
+                        billable_images: 1,
+                        status_code: 200,
+                        latency_ms: started.elapsed().as_millis() as i64,
+                        error_code: None,
+                        error_message: None,
+                        detail_ref: None,
+                        created_at: unix_timestamp_secs(),
+                    };
+                    self.storage.control.apply_success_settlement(&event).await?;
+                    return Ok(result);
+                }
+                Err(error) => {
+                    self.record_account_failure(&account, &error.to_string()).await?;
+                    last_error = Some(error.to_string());
+                    if is_token_invalid_error(&error.to_string()) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        bail!(last_error.unwrap_or_else(|| "chat completion failed".to_string()))
+    }
+
+    async fn start_public_text_stream(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        endpoint: &str,
+    ) -> Result<ChatgptTextStream> {
+        ensure_key_can_consume(key, 1).map_err(|error| anyhow!(error.to_string()))?;
+        let key_lease = self.acquire_key_lease(key).await?;
+        let _keep_key_lease = key_lease;
+
+        let request_id = Uuid::new_v4().to_string();
+        let started = Instant::now();
+        let max_attempts = self.storage.control.list_accounts().await?.len().max(1);
+        let mut last_error = None;
+
+        for _ in 0..max_attempts {
+            let (account, lease) = self.acquire_account_for_key(key).await?;
+            let _keep_account_lease = lease;
+            let account = self.refresh_account_if_needed(account).await?;
+            if !is_account_routeable(&account) {
+                last_error = Some("no available accounts".to_string());
+                continue;
+            }
+            match self.upstream.start_text_stream(&account, prompt, requested_model).await {
+                Ok(stream) => {
+                    self.record_account_success(&account).await?;
+                    let event = UsageEventRecord {
+                        event_id: Uuid::new_v4().to_string(),
+                        request_id,
+                        key_id: key.id.clone(),
+                        key_name: key.name.clone(),
+                        account_name: account.name.clone(),
+                        endpoint: endpoint.to_string(),
+                        requested_model: requested_model.to_string(),
+                        resolved_upstream_model: stream.resolved_model.clone(),
+                        requested_n: 1,
+                        generated_n: 1,
+                        billable_images: 1,
+                        status_code: 200,
+                        latency_ms: started.elapsed().as_millis() as i64,
+                        error_code: None,
+                        error_message: None,
+                        detail_ref: None,
+                        created_at: unix_timestamp_secs(),
+                    };
+                    self.storage.control.apply_success_settlement(&event).await?;
+                    return Ok(stream);
+                }
+                Err(error) => {
+                    self.record_account_failure(&account, &error.to_string()).await?;
+                    last_error = Some(error.to_string());
+                    if is_token_invalid_error(&error.to_string()) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        bail!(last_error.unwrap_or_else(|| "chat completion failed".to_string()))
     }
 
     async fn acquire_key_lease(&self, key: &ApiKeyRecord) -> Result<Lease> {
@@ -553,10 +959,11 @@ impl AppService {
     }
 
     async fn refresh_account_if_needed(&self, account: AccountRecord) -> Result<AccountRecord> {
-        let stale = account
-            .last_refresh_at
-            .map(|last| unix_timestamp_secs() - last >= DEFAULT_REFRESH_SECONDS as i64)
-            .unwrap_or(true);
+        let Some(last_refresh_at) = account.last_refresh_at else {
+            return Ok(account);
+        };
+        let stale =
+            unix_timestamp_secs().saturating_sub(last_refresh_at) >= DEFAULT_REFRESH_SECONDS as i64;
         if !stale {
             return Ok(account);
         }
@@ -641,8 +1048,74 @@ fn is_account_routeable(account: &AccountRecord) -> bool {
     account.status == "active"
 }
 
-fn sha1_hex(raw: &str) -> String {
-    let mut hasher = Sha1::new();
+fn ensure_key_can_consume(
+    key: &ApiKeyRecord,
+    cost: i64,
+) -> std::result::Result<(), PublicAuthError> {
+    if key.status != "active" {
+        return Err(PublicAuthError::Disabled);
+    }
+    if cost <= 0 {
+        return Ok(());
+    }
+    if key.quota_total_calls <= 0
+        || key.quota_used_calls.saturating_add(cost) > key.quota_total_calls
+    {
+        return Err(PublicAuthError::QuotaExhausted);
+    }
+    Ok(())
+}
+
+fn normalize_api_key_status(raw: &str) -> Result<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "active" => Ok("active".to_string()),
+        "disabled" => Ok("disabled".to_string()),
+        _ => bail!("status must be active or disabled"),
+    }
+}
+
+fn normalize_route_strategy(raw: &str) -> Result<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok("auto".to_string()),
+        "fixed" => Ok("fixed".to_string()),
+        _ => bail!("route_strategy must be auto or fixed"),
+    }
+}
+
+fn normalize_required_string(raw: &str, field_name: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        bail!("{field_name} is required");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_optional_string(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string)
+}
+
+fn validate_quota_total_calls(value: i64) -> Result<i64> {
+    if value < 0 {
+        bail!("quota_total_calls must be >= 0");
+    }
+    Ok(value)
+}
+
+fn generate_api_key_plaintext() -> String {
+    format!("sk-{}", Uuid::new_v4().simple())
+}
+
+fn response_model_name(requested_model: &str, resolved_model: &str) -> String {
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() {
+        resolved_model.to_string()
+    } else {
+        requested_model.to_string()
+    }
+}
+
+fn sha256_hex(raw: &str) -> String {
+    let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     format!("{:x}", hasher.finalize())
 }

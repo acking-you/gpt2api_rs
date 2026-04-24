@@ -472,7 +472,13 @@ pub async fn get_task(
     }
     .map_err(AppError::internal)?
     .ok_or_else(|| AppError::not_found("task not found"))?;
-    Ok(Json(json!({ "task": task })))
+    let queue = service
+        .storage()
+        .control
+        .queue_snapshot_for_task(&task.id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({ "task": task, "queue": queue })))
 }
 
 /// Cancels one queued task visible to the current product key.
@@ -490,6 +496,30 @@ pub async fn cancel_task(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(json!({ "cancelled": cancelled })))
+}
+
+/// Streams one artifact visible to the current product key.
+pub async fn get_artifact(
+    Path(artifact_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let artifact = service
+        .storage()
+        .control
+        .get_image_artifact(&artifact_id)
+        .await
+        .map_err(AppError::internal)?
+        .filter(|artifact| artifact.key_id == key.id || service.is_product_admin(&key))
+        .ok_or_else(|| AppError::not_found("artifact not found"))?;
+    let bytes =
+        service.storage().artifacts.read_artifact(&artifact).await.map_err(AppError::internal)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, artifact.mime_type)
+        .body(Body::from(bytes))
+        .map_err(AppError::internal)
 }
 
 /// Returns the product-admin queue snapshot.

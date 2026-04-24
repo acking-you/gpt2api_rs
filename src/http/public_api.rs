@@ -67,15 +67,18 @@ pub async fn login(
 ) -> Result<Json<Value>, AppError> {
     let key = authenticate_key(&service, &headers).await?;
     Ok(Json(json!({
-        "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
-        "key": {
-            "id": key.id,
-            "name": key.name,
-            "status": key.status,
-            "quota_total_calls": key.quota_total_calls,
+    "ok": true,
+    "version": env!("CARGO_PKG_VERSION"),
+    "key": {
+        "id": key.id,
+        "name": key.name,
+        "status": key.status,
+        "quota_total_calls": key.quota_total_calls,
             "quota_used_calls": key.quota_used_calls,
             "route_strategy": key.route_strategy,
+            "role": key.role.as_str(),
+            "notification_email": key.notification_email,
+            "notification_enabled": key.notification_enabled,
         }
     })))
 }

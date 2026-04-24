@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::AppError,
-    models::{ApiKeyRecord, BrowserProfile, ProxyConfigRecord, UsageEventRecord},
+    models::{ApiKeyRecord, ApiKeyRole, BrowserProfile, ProxyConfigRecord, UsageEventRecord},
     service::{
         AccountImportItem, AccountUpdate, AdminAccountView, ApiKeyCreate, ApiKeySecretRecord,
         ApiKeyUpdate, AppService, ProxyConfigCreate, ProxyConfigUpdate,
@@ -147,6 +147,15 @@ pub struct CreateKeyRequest {
     /// Optional per-key minimum start interval in milliseconds.
     #[serde(default)]
     request_min_start_interval_ms: Option<u64>,
+    /// Optional product role. Defaults to user.
+    #[serde(default)]
+    role: Option<ApiKeyRole>,
+    /// Optional default notification email.
+    #[serde(default)]
+    notification_email: Option<String>,
+    /// Optional notification toggle.
+    #[serde(default)]
+    notification_enabled: Option<bool>,
 }
 
 /// Request body for updating one downstream API key.
@@ -173,6 +182,15 @@ pub struct UpdateKeyRequest {
     /// Optional replacement minimum start interval. `null` clears the field.
     #[serde(default)]
     request_min_start_interval_ms: Option<Option<u64>>,
+    /// Optional replacement product role.
+    #[serde(default)]
+    role: Option<ApiKeyRole>,
+    /// Optional replacement notification email. `null` clears the field.
+    #[serde(default)]
+    notification_email: Option<Option<String>>,
+    /// Optional replacement notification toggle.
+    #[serde(default)]
+    notification_enabled: Option<bool>,
 }
 
 /// Returns a minimal operational snapshot for the admin control plane.
@@ -436,6 +454,9 @@ pub async fn create_key(
             account_group_id: body.account_group_id,
             request_max_concurrency: body.request_max_concurrency,
             request_min_start_interval_ms: body.request_min_start_interval_ms,
+            role: body.role,
+            notification_email: body.notification_email,
+            notification_enabled: body.notification_enabled,
         })
         .await
         .map_err(AppError::internal)?;
@@ -461,6 +482,9 @@ pub async fn update_key(
                 account_group_id: body.account_group_id,
                 request_max_concurrency: body.request_max_concurrency,
                 request_min_start_interval_ms: body.request_min_start_interval_ms,
+                role: body.role,
+                notification_email: body.notification_email,
+                notification_enabled: body.notification_enabled,
             },
         )
         .await
@@ -548,6 +572,9 @@ fn serialize_key(key: &ApiKeyRecord, secret_plaintext: Option<&str>) -> Value {
         "account_group_id": key.account_group_id,
         "request_max_concurrency": key.request_max_concurrency,
         "request_min_start_interval_ms": key.request_min_start_interval_ms,
+        "role": key.role.as_str(),
+        "notification_email": key.notification_email,
+        "notification_enabled": key.notification_enabled,
         "secret_plaintext": secret_plaintext,
     })
 }

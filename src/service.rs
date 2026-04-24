@@ -18,7 +18,7 @@ use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
     models::{
         AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
-        ProxyConfigRecord, UsageEventRecord,
+        ProxyConfigRecord, SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
     },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
@@ -192,6 +192,12 @@ pub struct ApiKeyCreate {
     pub request_max_concurrency: Option<u64>,
     /// Optional per-key minimum start interval in milliseconds.
     pub request_min_start_interval_ms: Option<u64>,
+    /// Optional product role. Defaults to user.
+    pub role: Option<ApiKeyRole>,
+    /// Optional default notification email.
+    pub notification_email: Option<String>,
+    /// Optional notification toggle.
+    pub notification_enabled: Option<bool>,
 }
 
 /// Mutable API-key fields allowed through the admin update surface.
@@ -211,6 +217,12 @@ pub struct ApiKeyUpdate {
     pub request_max_concurrency: Option<Option<u64>>,
     /// Optional replacement minimum start interval. `Some(None)` clears the field.
     pub request_min_start_interval_ms: Option<Option<u64>>,
+    /// Optional replacement product role.
+    pub role: Option<ApiKeyRole>,
+    /// Optional replacement notification email. `Some(None)` clears the field.
+    pub notification_email: Option<Option<String>>,
+    /// Optional replacement notification toggle.
+    pub notification_enabled: Option<bool>,
 }
 
 /// One admin-visible API-key record plus the stored plaintext secret.
@@ -299,6 +311,72 @@ impl AppService {
         bearer: &str,
     ) -> std::result::Result<ApiKeyRecord, PublicAuthFailure> {
         self.authenticate_public_key(bearer).await
+    }
+
+    /// Authenticates one downstream product API key.
+    pub async fn authenticate_product_key(
+        &self,
+        bearer: &str,
+    ) -> std::result::Result<ApiKeyRecord, PublicAuthFailure> {
+        self.authenticate_public_key(bearer).await
+    }
+
+    /// Returns whether a key has product-admin privileges.
+    #[must_use]
+    pub fn is_product_admin(&self, key: &ApiKeyRecord) -> bool {
+        key.role == ApiKeyRole::Admin
+    }
+
+    /// Creates one web session for an authenticated key.
+    pub async fn create_web_session(
+        &self,
+        key: &ApiKeyRecord,
+        title: Option<&str>,
+    ) -> Result<SessionRecord> {
+        self.storage
+            .control
+            .create_session(key.id.as_str(), title.unwrap_or("New chat"), SessionSource::Web)
+            .await
+    }
+
+    /// Fetches a key-scoped session detail.
+    pub async fn get_session_detail_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+    ) -> Result<Option<SessionDetail>> {
+        let Some(session) = self.storage.control.get_session_for_key(session_id, &key.id).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.build_session_detail(session).await?))
+    }
+
+    /// Fetches an admin-visible session detail.
+    pub async fn get_session_detail_for_admin(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionDetail>> {
+        let Some(session) = self.storage.control.get_session_for_admin(session_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.build_session_detail(session).await?))
+    }
+
+    /// Updates and returns one key-scoped session detail.
+    pub async fn patch_session_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        title: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Option<SessionDetail>> {
+        let Some(session) =
+            self.storage.control.update_session_for_key(session_id, &key.id, title, status).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.build_session_detail(session).await?))
     }
 
     /// Imports accounts and returns the refreshed account list.
@@ -521,9 +599,9 @@ impl AppService {
             account_group_id: normalize_optional_string(input.account_group_id.as_deref()),
             request_max_concurrency: input.request_max_concurrency,
             request_min_start_interval_ms: input.request_min_start_interval_ms,
-            role: ApiKeyRole::User,
-            notification_email: None,
-            notification_enabled: false,
+            role: input.role.unwrap_or(ApiKeyRole::User),
+            notification_email: normalize_optional_string(input.notification_email.as_deref()),
+            notification_enabled: input.notification_enabled.unwrap_or(false),
         };
         self.storage.control.upsert_api_key(&key).await?;
         Ok(ApiKeySecretRecord { key, secret_plaintext })
@@ -558,6 +636,15 @@ impl AppService {
         }
         if let Some(request_min_start_interval_ms) = update.request_min_start_interval_ms {
             key.request_min_start_interval_ms = request_min_start_interval_ms;
+        }
+        if let Some(role) = update.role {
+            key.role = role;
+        }
+        if let Some(notification_email) = &update.notification_email {
+            key.notification_email = normalize_optional_string(notification_email.as_deref());
+        }
+        if let Some(notification_enabled) = update.notification_enabled {
+            key.notification_enabled = notification_enabled;
         }
         self.storage.control.upsert_api_key(&key).await?;
         Ok(Some(key))
@@ -877,6 +964,11 @@ impl AppService {
             notification_enabled: false,
         };
         self.storage.control.upsert_api_key(&key).await
+    }
+
+    async fn build_session_detail(&self, session: SessionRecord) -> Result<SessionDetail> {
+        let messages = self.storage.control.list_messages_for_session(&session.id).await?;
+        Ok(SessionDetail { session, messages, tasks: Vec::new(), artifacts: Vec::new() })
     }
 
     async fn execute_public_image_request(

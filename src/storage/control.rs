@@ -756,6 +756,65 @@ impl ControlDb {
         .await?
     }
 
+    /// Updates title and/or status for a key-scoped session.
+    pub async fn update_session_for_key(
+        &self,
+        session_id: &str,
+        key_id: &str,
+        title: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Option<SessionRecord>> {
+        let path = self.path.clone();
+        let session_id = session_id.to_string();
+        let key_id = key_id.to_string();
+        let title = title.map(normalize_session_title);
+        let status = status.map(ToString::to_string);
+        tokio::task::spawn_blocking(move || -> Result<Option<SessionRecord>> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE id = ?1 AND key_id = ?2 LIMIT 1",
+                    params![&session_id, &key_id],
+                    |_| Ok(()),
+                )
+                .map(|_| true)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                    other => Err(other),
+                })?;
+            if !exists {
+                return Ok(None);
+            }
+            if let Some(title) = title {
+                tx.execute(
+                    "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3 AND key_id = ?4",
+                    params![title, unix_timestamp_secs(), &session_id, &key_id],
+                )?;
+            }
+            if let Some(status) = status {
+                tx.execute(
+                    "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3 AND key_id = ?4",
+                    params![status, unix_timestamp_secs(), &session_id, &key_id],
+                )?;
+            }
+            let session = {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT id, key_id, title, source, status, created_at, updated_at, last_message_at
+                    FROM sessions
+                    WHERE id = ?1 AND key_id = ?2
+                    LIMIT 1
+                    "#,
+                )?;
+                stmt.query_row(params![session_id, key_id], session_from_row)?
+            };
+            tx.commit()?;
+            Ok(Some(session))
+        })
+        .await?
+    }
+
     /// Lists sessions owned by one key in reverse update order.
     pub async fn list_sessions_for_key(
         &self,

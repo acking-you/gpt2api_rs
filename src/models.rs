@@ -267,6 +267,19 @@ pub struct SessionRecord {
     pub last_message_at: Option<i64>,
 }
 
+/// Complete session detail returned by product APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDetail {
+    /// Session metadata.
+    pub session: SessionRecord,
+    /// Ordered persisted messages.
+    pub messages: Vec<MessageRecord>,
+    /// Image tasks associated with the session.
+    pub tasks: Vec<ImageTaskRecord>,
+    /// Image artifacts associated with the session.
+    pub artifacts: Vec<ImageArtifactRecord>,
+}
+
 /// Message lifecycle status.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

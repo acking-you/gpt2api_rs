@@ -15,9 +15,15 @@ use crate::{
     models::{ApiKeyRecord, ApiKeyRole, BrowserProfile, ProxyConfigRecord, UsageEventRecord},
     service::{
         AccountImportItem, AccountUpdate, AdminAccountView, ApiKeyCreate, ApiKeySecretRecord,
-        ApiKeyUpdate, AppService, ProxyConfigCreate, ProxyConfigUpdate,
+        ApiKeyUpdate, AppService, ProxyConfigCreate, ProxyConfigUpdate, PublicAuthError,
+        PublicAuthFailure,
     },
 };
+
+enum KeyAdminAuth {
+    ServiceAdmin,
+    ProductAdmin,
+}
 
 /// Query parameters supported by the usage listing endpoint.
 #[derive(Debug, Deserialize)]
@@ -432,10 +438,20 @@ pub async fn check_proxy_config(
 pub async fn list_keys(
     State(service): State<Arc<AppService>>,
     headers: HeaderMap,
-) -> Result<Json<Vec<ApiKeyRecord>>, AppError> {
-    require_admin(&headers, &service)?;
+) -> Result<Json<Value>, AppError> {
+    let auth = require_key_admin(&headers, &service).await?;
     let keys = service.storage().control.list_api_keys().await.map_err(AppError::internal)?;
-    Ok(Json(keys))
+    let include_secret = matches!(auth, KeyAdminAuth::ServiceAdmin);
+    Ok(Json(Value::Array(
+        keys.iter()
+            .map(|key| {
+                serialize_key(
+                    key,
+                    include_secret.then_some(key.secret_plaintext.as_deref()).flatten(),
+                )
+            })
+            .collect(),
+    )))
 }
 
 /// Creates one downstream API key and returns the stored plaintext secret.
@@ -470,7 +486,7 @@ pub async fn update_key(
     headers: HeaderMap,
     Json(body): Json<UpdateKeyRequest>,
 ) -> Result<Json<Value>, AppError> {
-    require_admin(&headers, &service)?;
+    let auth = require_key_admin(&headers, &service).await?;
     let Some(key) = service
         .update_api_key(
             &key_id,
@@ -492,7 +508,11 @@ pub async fn update_key(
     else {
         return Err(AppError::not_found("key not found"));
     };
-    Ok(Json(serialize_key(&key, None)))
+    let secret = match auth {
+        KeyAdminAuth::ServiceAdmin => key.secret_plaintext.as_deref(),
+        KeyAdminAuth::ProductAdmin => None,
+    };
+    Ok(Json(serialize_key(&key, secret)))
 }
 
 /// Rotates one downstream API key and returns the stored plaintext secret.
@@ -538,16 +558,55 @@ pub async fn list_usage(
 }
 
 fn require_admin(headers: &HeaderMap, service: &Arc<AppService>) -> Result<(), AppError> {
-    let token = headers
+    let token = extract_bearer_token(headers);
+    if service.is_admin_token(&token) {
+        Ok(())
+    } else {
+        Err(AppError::with_status(StatusCode::UNAUTHORIZED, "authorization is invalid"))
+    }
+}
+
+async fn require_key_admin(
+    headers: &HeaderMap,
+    service: &Arc<AppService>,
+) -> Result<KeyAdminAuth, AppError> {
+    let token = extract_bearer_token(headers);
+    if service.is_admin_token(&token) {
+        return Ok(KeyAdminAuth::ServiceAdmin);
+    }
+    let key = service.authenticate_product_key(&token).await.map_err(map_product_auth_failure)?;
+    if service.is_product_admin(&key) {
+        Ok(KeyAdminAuth::ProductAdmin)
+    } else {
+        Err(AppError::with_status(StatusCode::FORBIDDEN, "admin role required"))
+    }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> String {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        .unwrap_or_default();
-    if service.is_admin_token(token) {
-        Ok(())
-    } else {
-        Err(AppError::with_status(StatusCode::UNAUTHORIZED, "authorization is invalid"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn map_product_auth_failure(error: PublicAuthFailure) -> AppError {
+    match error {
+        PublicAuthFailure::Auth(error) => map_product_auth_error(error),
+        PublicAuthFailure::Internal(error) => AppError::internal(error),
+    }
+}
+
+fn map_product_auth_error(error: PublicAuthError) -> AppError {
+    match error {
+        PublicAuthError::InvalidKey => {
+            AppError::with_status(StatusCode::UNAUTHORIZED, error.to_string())
+        }
+        PublicAuthError::Disabled | PublicAuthError::QuotaExhausted => {
+            AppError::with_status(StatusCode::FORBIDDEN, error.to_string())
+        }
     }
 }
 
@@ -560,7 +619,6 @@ fn serialize_key_record(record: &ApiKeySecretRecord, include_secret: bool) -> Va
 }
 
 fn serialize_key(key: &ApiKeyRecord, secret_plaintext: Option<&str>) -> Value {
-    let secret_plaintext = secret_plaintext.or(key.secret_plaintext.as_deref());
     json!({
         "id": key.id,
         "name": key.name,

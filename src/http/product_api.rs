@@ -92,6 +92,14 @@ pub struct CreateMessageRequest {
     n: Option<usize>,
 }
 
+/// Body for product-admin queue configuration updates.
+#[derive(Debug, Default, Deserialize)]
+pub struct AdminQueueConfigRequest {
+    /// Replacement global image concurrency.
+    #[serde(default)]
+    global_image_concurrency: Option<i64>,
+}
+
 /// Verifies a product API key.
 pub async fn verify_auth(
     State(service): State<Arc<AppService>>,
@@ -484,6 +492,65 @@ pub async fn cancel_task(
     Ok(Json(json!({ "cancelled": cancelled })))
 }
 
+/// Returns the product-admin queue snapshot.
+pub async fn admin_queue(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    ensure_product_admin(&service, &key)?;
+    let snapshot =
+        service.storage().control.queue_snapshot_admin().await.map_err(AppError::internal)?;
+    let config =
+        service.storage().control.get_runtime_config().await.map_err(AppError::internal)?;
+    Ok(Json(json!({ "queue": snapshot, "config": config })))
+}
+
+/// Updates product-admin queue configuration.
+pub async fn patch_admin_queue_config(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<AdminQueueConfigRequest>,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    ensure_product_admin(&service, &key)?;
+    let current =
+        service.storage().control.get_runtime_config().await.map_err(AppError::internal)?;
+    let global_image_concurrency =
+        body.global_image_concurrency.unwrap_or(current.global_image_concurrency);
+    if !(1..=16).contains(&global_image_concurrency) {
+        return Err(AppError::bad_request("global_image_concurrency must be between 1 and 16"));
+    }
+    let config = service
+        .storage()
+        .control
+        .update_runtime_config_product_fields(
+            global_image_concurrency,
+            current.signed_link_ttl_seconds,
+            current.queue_eta_window_size,
+        )
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({ "config": config })))
+}
+
+/// Cancels any queued task as product-admin.
+pub async fn admin_cancel_task(
+    Path(task_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    ensure_product_admin(&service, &key)?;
+    let cancelled = service
+        .storage()
+        .control
+        .cancel_queued_image_task(&task_id, None)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({ "cancelled": cancelled })))
+}
+
 /// Lists sessions across keys for product-admin API keys.
 pub async fn list_admin_sessions(
     Query(query): Query<SessionListQuery>,
@@ -506,6 +573,14 @@ pub async fn list_admin_sessions(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(json!({ "items": items })))
+}
+
+fn ensure_product_admin(service: &Arc<AppService>, key: &ApiKeyRecord) -> Result<(), AppError> {
+    if service.is_product_admin(key) {
+        Ok(())
+    } else {
+        Err(AppError::with_status(StatusCode::FORBIDDEN, "admin role required"))
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {

@@ -184,3 +184,52 @@ async fn queued_task_can_be_cancelled_by_owner() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["cancelled"], true);
 }
+
+#[tokio::test]
+async fn admin_key_can_update_global_queue_concurrency() {
+    let (_temp, app, _storage) = build_app().await;
+    let (status, value) = json_request(
+        app.clone(),
+        "PATCH",
+        "/admin/queue/config",
+        "sk-admin-a",
+        json!({"global_image_concurrency":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["config"]["global_image_concurrency"], 2);
+
+    let (user_status, _user_value) = json_request(
+        app,
+        "PATCH",
+        "/admin/queue/config",
+        "sk-user-a",
+        json!({"global_image_concurrency":3}),
+    )
+    .await;
+    assert_eq!(user_status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn product_admin_can_list_and_patch_keys_without_plaintext_secrets() {
+    let (_temp, app, _storage) = build_app().await;
+    let (list_status, list_value) =
+        json_request(app.clone(), "GET", "/admin/keys", "sk-admin-a", json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let items = list_value.as_array().expect("key array");
+    let user_key = items.iter().find(|item| item["id"] == "user-a").expect("user-a key");
+    assert!(user_key["secret_plaintext"].is_null());
+
+    let (patch_status, patched) = json_request(
+        app,
+        "PATCH",
+        "/admin/keys/user-a",
+        "sk-admin-a",
+        json!({"role":"admin","notification_enabled":true}),
+    )
+    .await;
+    assert_eq!(patch_status, StatusCode::OK);
+    assert_eq!(patched["role"], "admin");
+    assert_eq!(patched["notification_enabled"], true);
+    assert!(patched["secret_plaintext"].is_null());
+}

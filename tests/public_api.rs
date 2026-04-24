@@ -23,6 +23,12 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
+const ONE_PIXEL_PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89,
+];
+
 async fn build_test_app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = ResolvedPaths::new(temp.path().to_path_buf());
@@ -286,4 +292,77 @@ async fn text_chat_completion_streams_openai_sse_chunks() {
     assert!(text.contains("\"content\":\"Hello\""));
     assert!(text.contains("\"content\":\" world\""));
     assert!(text.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn compatible_image_generation_writes_api_session_history() {
+    let (_temp, app, mock) = build_chat_test_app().await;
+    mount_image_generation_mocks(&mock).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-image-1","prompt":"draw a lake","n":1}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sessions = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/sessions?limit=20")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("sessions response");
+    assert_eq!(sessions.status(), StatusCode::OK);
+    let bytes = to_bytes(sessions.into_body(), 1024 * 1024).await.expect("body");
+    let value: Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(value["items"].as_array().expect("items").iter().any(|item| item["source"] == "api"));
+}
+
+async fn mount_image_generation_mocks(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+        .mount(mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/sentinel/chat-requirements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token": "chat-token",
+            "proofofwork": { "required": false }
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/conversation"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "data: {\"conversation_id\":\"conv-1\",\"message\":{\"author\":{\"role\":\"tool\"},\"content\":{\"content_type\":\"multimodal_text\",\"parts\":[{\"asset_pointer\":\"file-service://file-1\"}]}}}\n\ndata: [DONE]\n\n",
+            "text/event-stream",
+        ))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/files/file-1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "download_url": format!("{}/image.png", mock.uri())
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/image.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ONE_PIXEL_PNG, "image/png"))
+        .mount(mock)
+        .await;
 }

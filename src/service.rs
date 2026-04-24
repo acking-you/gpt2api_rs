@@ -19,15 +19,15 @@ use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
     models::{
         AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
-        ImageSubmissionResult, ImageTaskRecord, MessageStatus, ProxyConfigRecord, SessionDetail,
-        SessionRecord, SessionSource, UsageEventRecord,
+        ImageSubmissionResult, ImageTaskRecord, MessageRecord, MessageStatus, ProxyConfigRecord,
+        SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
     },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
     storage::{control::CreateImageTaskInput, Storage},
     upstream::chatgpt::{
         access_token_expires_at, is_token_invalid_error, ChatgptImageResult, ChatgptTextResult,
-        ChatgptTextStream, ChatgptUpstreamClient,
+        ChatgptTextStream, ChatgptUpstreamClient, GeneratedImageItem,
     },
 };
 
@@ -351,6 +351,33 @@ impl AppService {
             .await
     }
 
+    /// Resolves or creates the API-backed session used by compatible endpoints.
+    pub async fn resolve_api_session(
+        &self,
+        key: &ApiKeyRecord,
+        supplied_session_id: Option<&str>,
+    ) -> Result<SessionRecord> {
+        if let Some(session_id) =
+            supplied_session_id.map(str::trim).filter(|value| !value.is_empty())
+        {
+            return self
+                .storage
+                .control
+                .get_session_for_key(session_id, &key.id)
+                .await?
+                .ok_or_else(|| anyhow!("x-gpt2api-session-id does not belong to this key"));
+        }
+
+        let sessions = self.storage.control.list_sessions_for_key(&key.id, 50, None).await?;
+        if let Some(session) = sessions
+            .into_iter()
+            .find(|session| session.source == SessionSource::Api && session.status == "active")
+        {
+            return Ok(session);
+        }
+        self.storage.control.create_session(&key.id, "API Requests", SessionSource::Api).await
+    }
+
     /// Fetches a key-scoped session detail.
     pub async fn get_session_detail_for_key(
         &self,
@@ -555,6 +582,146 @@ impl AppService {
             task: queue.task.clone(),
             queue,
         }))
+    }
+
+    /// Appends one API user text message.
+    pub async fn append_api_user_text_message(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        prompt: &str,
+        model: &str,
+        endpoint: &str,
+    ) -> Result<MessageRecord> {
+        self.storage
+            .control
+            .append_message(
+                session_id,
+                &key.id,
+                "user",
+                json!({
+                    "blocks": [{ "type": "text", "text": prompt }],
+                    "source": "api",
+                    "endpoint": endpoint,
+                    "model": model,
+                }),
+                MessageStatus::Done,
+            )
+            .await
+    }
+
+    /// Appends one API assistant text message after a successful completion.
+    pub async fn append_api_assistant_text_message(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        user_message_id: &str,
+        result: &ChatgptTextResult,
+    ) -> Result<MessageRecord> {
+        self.storage
+            .control
+            .append_message(
+                session_id,
+                &key.id,
+                "assistant",
+                json!({
+                    "blocks": [{ "type": "text", "text": result.text }],
+                    "parent_message_id": user_message_id,
+                    "model": result.resolved_model,
+                }),
+                MessageStatus::Done,
+            )
+            .await
+    }
+
+    /// Appends one API assistant failure message.
+    pub async fn append_api_failed_assistant_message(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        user_message_id: &str,
+        error_message: &str,
+    ) -> Result<MessageRecord> {
+        self.storage
+            .control
+            .append_message(
+                session_id,
+                &key.id,
+                "assistant",
+                json!({
+                    "blocks": [{ "type": "error", "text": error_message }],
+                    "parent_message_id": user_message_id,
+                }),
+                MessageStatus::Failed,
+            )
+            .await
+    }
+
+    /// Waits for an image task to finish, helping drain queued work when needed.
+    pub async fn wait_for_image_task(
+        &self,
+        task_id: &str,
+        timeout: Duration,
+    ) -> Result<ImageTaskRecord> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(task) = self.storage.control.get_image_task(task_id).await? else {
+                bail!("image task not found");
+            };
+            match task.status {
+                crate::models::ImageTaskStatus::Succeeded => return Ok(task),
+                crate::models::ImageTaskStatus::Failed => {
+                    bail!(task.error_message.unwrap_or_else(|| "image task failed".to_string()));
+                }
+                crate::models::ImageTaskStatus::Cancelled => bail!("image task cancelled"),
+                crate::models::ImageTaskStatus::Queued
+                | crate::models::ImageTaskStatus::Running => {}
+            }
+            if Instant::now() >= deadline {
+                bail!("image task timed out");
+            }
+
+            let config = self.storage.control.get_runtime_config().await?;
+            if let Some(claimed) = self
+                .storage
+                .control
+                .claim_next_image_task(config.global_image_concurrency, unix_timestamp_secs())
+                .await?
+            {
+                let claimed_id = claimed.id.clone();
+                if let Err(error) = self.execute_claimed_image_task(claimed).await {
+                    if claimed_id == task_id {
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Builds the OpenAI-compatible image result for a completed persisted task.
+    pub async fn image_result_for_task(
+        &self,
+        task: &ImageTaskRecord,
+    ) -> Result<ChatgptImageResult> {
+        let artifacts = self.storage.control.list_artifacts_for_session(&task.session_id).await?;
+        let mut data = Vec::new();
+        for artifact in artifacts.into_iter().filter(|artifact| artifact.task_id == task.id) {
+            let bytes = self.storage.artifacts.read_artifact(&artifact).await?;
+            data.push(GeneratedImageItem {
+                b64_json: BASE64.encode(bytes),
+                revised_prompt: artifact.revised_prompt.unwrap_or_else(|| task.prompt.clone()),
+            });
+        }
+        if data.is_empty() {
+            bail!("image task completed without artifacts");
+        }
+        Ok(ChatgptImageResult {
+            created: task.finished_at.unwrap_or_else(unix_timestamp_secs),
+            data,
+            resolved_model: task.model.clone(),
+        })
     }
 
     /// Imports accounts and returns the refreshed account list.

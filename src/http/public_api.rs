@@ -1,6 +1,6 @@
 //! Public OpenAI-compatible image endpoints.
 
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
+    models::ApiKeyRecord,
     service::{AppService, ImageEditInput, PublicAuthError, PublicAuthFailure},
-    upstream::chatgpt::ChatgptTextStream,
+    upstream::chatgpt::{ChatgptImageResult, ChatgptTextResult, ChatgptTextStream},
 };
 
 /// Request body for `/v1/images/generations`.
@@ -91,17 +92,28 @@ pub async fn generate_images(
 ) -> Result<Json<Value>, AppError> {
     let key = authenticate_key(&service, &headers).await?;
     let n = validate_image_count(body.n)?;
-    let result = service
-        .generate_images_for_key(&key, body.prompt.trim(), body.model.trim(), n)
+    let session = service
+        .resolve_api_session(&key, extract_session_header(&headers).as_deref())
         .await
         .map_err(map_public_request_error)?;
-    Ok(Json(json!({
-        "created": result.created,
-        "data": result.data.into_iter().map(|item| json!({
-            "b64_json": item.b64_json,
-            "revised_prompt": item.revised_prompt,
-        })).collect::<Vec<_>>(),
-    })))
+    let submission = service
+        .submit_image_generation_message(
+            &key,
+            &session.id,
+            body.prompt.trim(),
+            body.model.trim(),
+            n,
+        )
+        .await
+        .map_err(map_public_request_error)?
+        .ok_or_else(|| AppError::bad_request("session not found"))?;
+    let completed = service
+        .wait_for_image_task(&submission.task.id, Duration::from_secs(180))
+        .await
+        .map_err(map_public_request_error)?;
+    let result =
+        service.image_result_for_task(&completed).await.map_err(map_public_request_error)?;
+    Ok(Json(image_generation_json(result)))
 }
 
 /// Handles `/v1/images/edits`.
@@ -159,23 +171,29 @@ pub async fn edit_images(
     let image_data = image_data
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::bad_request("image file is required"))?;
-    let result = service
-        .edit_images_for_key(
+    let session = service
+        .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+        .await
+        .map_err(map_public_request_error)?;
+    let submission = service
+        .submit_image_edit_message(
             &key,
+            &session.id,
             prompt.trim(),
             model.trim(),
             validate_image_count(n)?,
             ImageEditInput { image_data, file_name, mime_type },
         )
         .await
+        .map_err(map_public_request_error)?
+        .ok_or_else(|| AppError::bad_request("session not found"))?;
+    let completed = service
+        .wait_for_image_task(&submission.task.id, Duration::from_secs(180))
+        .await
         .map_err(map_public_request_error)?;
-    Ok(Json(json!({
-        "created": result.created,
-        "data": result.data.into_iter().map(|item| json!({
-            "b64_json": item.b64_json,
-            "revised_prompt": item.revised_prompt,
-        })).collect::<Vec<_>>(),
-    })))
+    let result =
+        service.image_result_for_task(&completed).await.map_err(map_public_request_error)?;
+    Ok(Json(image_generation_json(result)))
 }
 
 /// Handles `/v1/chat/completions` for image-generation shaped requests.
@@ -197,26 +215,86 @@ pub async fn create_chat_completion(
             return Err(AppError::bad_request("stream is not supported for image generation"));
         }
         let n = validate_image_count(body.get("n").and_then(Value::as_u64).unwrap_or(1) as usize)?;
-        let result = match extract_chat_image(&body)? {
+        let session = service
+            .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+            .await
+            .map_err(map_public_request_error)?;
+        let submission = match extract_chat_image(&body)? {
             Some(edit_input) => {
-                service.edit_images_for_key(&key, &prompt, model, n, edit_input).await
+                service
+                    .submit_image_edit_message(&key, &session.id, &prompt, model, n, edit_input)
+                    .await
             }
-            None => service.generate_images_for_key(&key, &prompt, model, n).await,
+            None => {
+                service.submit_image_generation_message(&key, &session.id, &prompt, model, n).await
+            }
         }
-        .map_err(map_public_request_error)?;
+        .map_err(map_public_request_error)?
+        .ok_or_else(|| AppError::bad_request("session not found"))?;
+        let completed = service
+            .wait_for_image_task(&submission.task.id, Duration::from_secs(180))
+            .await
+            .map_err(map_public_request_error)?;
+        let result =
+            service.image_result_for_task(&completed).await.map_err(map_public_request_error)?;
         return Ok(Json(service.build_chat_completion_response(model, &result)).into_response());
     }
 
+    let session = service
+        .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+        .await
+        .map_err(map_public_request_error)?;
+    let user_message = service
+        .append_api_user_text_message(&key, &session.id, &prompt, model, "/v1/chat/completions")
+        .await
+        .map_err(map_public_request_error)?;
     if stream {
-        let upstream = service
+        let upstream = match service
             .start_text_stream_for_key(&key, &prompt, model, "/v1/chat/completions")
             .await
-            .map_err(map_public_request_error)?;
-        return build_streaming_chat_completion_response(model, upstream);
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let _ = service
+                    .append_api_failed_assistant_message(
+                        &key,
+                        &session.id,
+                        &user_message.id,
+                        &error.to_string(),
+                    )
+                    .await;
+                return Err(map_public_request_error(error));
+            }
+        };
+        return build_streaming_chat_completion_response(
+            model,
+            upstream,
+            Some(StreamPersistence {
+                service,
+                key,
+                session_id: session.id,
+                user_message_id: user_message.id,
+            }),
+        );
     }
 
-    let result = service
-        .complete_text_for_key(&key, &prompt, model, "/v1/chat/completions")
+    let result =
+        match service.complete_text_for_key(&key, &prompt, model, "/v1/chat/completions").await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = service
+                    .append_api_failed_assistant_message(
+                        &key,
+                        &session.id,
+                        &user_message.id,
+                        &error.to_string(),
+                    )
+                    .await;
+                return Err(map_public_request_error(error));
+            }
+        };
+    service
+        .append_api_assistant_text_message(&key, &session.id, &user_message.id, &result)
         .await
         .map_err(map_public_request_error)?;
     Ok(Json(service.build_text_chat_completion_response(model, &result)).into_response())
@@ -238,18 +316,64 @@ pub async fn create_response(
     }
     let model = body.get("model").and_then(Value::as_str).unwrap_or("gpt-5");
     if has_response_image_generation_tool(&body) {
-        let result = match extract_response_image(body.get("input"))? {
+        let session = service
+            .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+            .await
+            .map_err(map_public_request_error)?;
+        let submission = match extract_response_image(body.get("input"))? {
             Some(edit_input) => {
-                service.edit_images_for_key(&key, &prompt, "gpt-image-1", 1, edit_input).await
+                service
+                    .submit_image_edit_message(
+                        &key,
+                        &session.id,
+                        &prompt,
+                        "gpt-image-1",
+                        1,
+                        edit_input,
+                    )
+                    .await
             }
-            None => service.generate_images_for_key(&key, &prompt, "gpt-image-1", 1).await,
+            None => {
+                service
+                    .submit_image_generation_message(&key, &session.id, &prompt, "gpt-image-1", 1)
+                    .await
+            }
         }
-        .map_err(map_public_request_error)?;
+        .map_err(map_public_request_error)?
+        .ok_or_else(|| AppError::bad_request("session not found"))?;
+        let completed = service
+            .wait_for_image_task(&submission.task.id, Duration::from_secs(180))
+            .await
+            .map_err(map_public_request_error)?;
+        let result =
+            service.image_result_for_task(&completed).await.map_err(map_public_request_error)?;
         return Ok(Json(service.build_responses_api_response(model, &result)).into_response());
     }
 
-    let result = service
-        .complete_text_for_key(&key, &prompt, model, "/v1/responses")
+    let session = service
+        .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+        .await
+        .map_err(map_public_request_error)?;
+    let user_message = service
+        .append_api_user_text_message(&key, &session.id, &prompt, model, "/v1/responses")
+        .await
+        .map_err(map_public_request_error)?;
+    let result = match service.complete_text_for_key(&key, &prompt, model, "/v1/responses").await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = service
+                .append_api_failed_assistant_message(
+                    &key,
+                    &session.id,
+                    &user_message.id,
+                    &error.to_string(),
+                )
+                .await;
+            return Err(map_public_request_error(error));
+        }
+    };
+    service
+        .append_api_assistant_text_message(&key, &session.id, &user_message.id, &result)
         .await
         .map_err(map_public_request_error)?;
     Ok(Json(service.build_text_responses_api_response(model, &result)).into_response())
@@ -260,6 +384,15 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_session_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-gpt2api-session-id")
+        .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
@@ -297,21 +430,45 @@ fn map_public_request_error(error: anyhow::Error) -> AppError {
         "invalid_key" => map_public_auth_error(PublicAuthError::InvalidKey),
         "disabled" => map_public_auth_error(PublicAuthError::Disabled),
         "quota_exhausted" => map_public_auth_error(PublicAuthError::QuotaExhausted),
+        "x-gpt2api-session-id does not belong to this key" => {
+            AppError::bad_request("x-gpt2api-session-id does not belong to this key")
+        }
         _ => AppError::upstream(error),
     }
+}
+
+fn image_generation_json(result: ChatgptImageResult) -> Value {
+    json!({
+        "created": result.created,
+        "data": result.data.into_iter().map(|item| json!({
+            "b64_json": item.b64_json,
+            "revised_prompt": item.revised_prompt,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+#[derive(Clone)]
+struct StreamPersistence {
+    service: Arc<AppService>,
+    key: ApiKeyRecord,
+    session_id: String,
+    user_message_id: String,
 }
 
 fn build_streaming_chat_completion_response(
     requested_model: &str,
     upstream: ChatgptTextStream,
+    persistence: Option<StreamPersistence>,
 ) -> Result<Response, AppError> {
-    let mut upstream_response = upstream.response;
     let stream_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let model_name = response_model_name(requested_model, &upstream.resolved_model);
     let created = upstream.created;
+    let resolved_model = upstream.resolved_model;
+    let model_name = response_model_name(requested_model, &resolved_model);
+    let mut upstream_response = upstream.response;
     let stream = async_stream::stream! {
         let mut state = StreamingChatState::new(stream_id, created, model_name);
         let mut buffer = Vec::new();
+        let mut stream_error = None;
         loop {
             match upstream_response.chunk().await {
                 Ok(Some(chunk)) => {
@@ -326,6 +483,7 @@ fn build_streaming_chat_completion_response(
                     break;
                 }
                 Err(error) => {
+                    stream_error = Some(error.to_string());
                     yield Ok::<Bytes, Infallible>(Bytes::from(format!(
                         "event: error\ndata: {}\n\n",
                         json!({ "error": error.to_string() })
@@ -343,6 +501,34 @@ fn build_streaming_chat_completion_response(
         if !state.finished {
             yield Ok::<Bytes, Infallible>(Bytes::from(state.finish_payload()));
             yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+        }
+        if let Some(persistence) = persistence {
+            if let Some(error) = stream_error {
+                let _ = persistence
+                    .service
+                    .append_api_failed_assistant_message(
+                        &persistence.key,
+                        &persistence.session_id,
+                        &persistence.user_message_id,
+                        &error,
+                    )
+                    .await;
+            } else {
+                let result = ChatgptTextResult {
+                    created,
+                    text: state.last_text,
+                    resolved_model,
+                };
+                let _ = persistence
+                    .service
+                    .append_api_assistant_text_message(
+                        &persistence.key,
+                        &persistence.session_id,
+                        &persistence.user_message_id,
+                        &result,
+                    )
+                    .await;
+            }
         }
     };
     Response::builder()

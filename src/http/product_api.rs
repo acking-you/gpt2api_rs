@@ -1,8 +1,13 @@
 //! Product workspace APIs authenticated by downstream API keys.
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
+    body::Body,
     extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
@@ -353,6 +358,98 @@ pub async fn session_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
+/// Returns one signed image-task share payload.
+pub async fn get_share(
+    Path(token): Path<String>,
+    State(service): State<Arc<AppService>>,
+) -> Result<Json<Value>, AppError> {
+    let link = service
+        .storage()
+        .control
+        .resolve_signed_link(&token, unix_timestamp_secs())
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("share link not found"))?;
+    if link.scope != "image_task" {
+        return Err(AppError::not_found("share link not found"));
+    }
+    let task = service
+        .storage()
+        .control
+        .get_image_task(&link.scope_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("task not found"))?;
+    let session = service
+        .storage()
+        .control
+        .get_session_for_admin(&task.session_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("session not found"))?;
+    let messages = service
+        .storage()
+        .control
+        .list_messages_for_session(&task.session_id)
+        .await
+        .map_err(AppError::internal)?;
+    let artifacts = service
+        .storage()
+        .control
+        .list_artifacts_for_session(&task.session_id)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .filter(|artifact| artifact.task_id == task.id)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "scope": link.scope,
+        "session": session,
+        "task": task,
+        "messages": messages,
+        "artifacts": artifacts,
+    })))
+}
+
+/// Streams one artifact belonging to a signed image-task share.
+pub async fn get_shared_artifact(
+    Path((token, artifact_id)): Path<(String, String)>,
+    State(service): State<Arc<AppService>>,
+) -> Result<Response, AppError> {
+    let link = service
+        .storage()
+        .control
+        .resolve_signed_link(&token, unix_timestamp_secs())
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("share link not found"))?;
+    if link.scope != "image_task" {
+        return Err(AppError::not_found("share link not found"));
+    }
+    let task = service
+        .storage()
+        .control
+        .get_image_task(&link.scope_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("task not found"))?;
+    let artifact = service
+        .storage()
+        .control
+        .get_image_artifact(&artifact_id)
+        .await
+        .map_err(AppError::internal)?
+        .filter(|artifact| artifact.task_id == task.id)
+        .ok_or_else(|| AppError::not_found("artifact not found"))?;
+    let bytes =
+        service.storage().artifacts.read_artifact(&artifact).await.map_err(AppError::internal)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, artifact.mime_type)
+        .body(Body::from(bytes))
+        .map_err(AppError::internal)
+}
+
 /// Returns one task visible to the current product key.
 pub async fn get_task(
     Path(task_id): Path<String>,
@@ -492,4 +589,9 @@ fn validate_image_count(n: usize) -> Result<usize, AppError> {
     } else {
         Err(AppError::bad_request("n must be between 1 and 4"))
     }
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_secs()
+        as i64
 }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod models;
+pub mod notifications;
 pub mod routing;
 pub mod scheduler;
 pub mod service;

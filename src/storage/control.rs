@@ -1658,6 +1658,45 @@ impl ControlDb {
         .await?
     }
 
+    /// Appends one task event using the task's stored session and key.
+    pub async fn append_task_event(
+        &self,
+        task_id: &str,
+        event_kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        let event_kind = event_kind.to_string();
+        let payload_json = serde_json::to_string(&payload)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = Connection::open(path)?;
+            let (session_id, key_id): (String, String) = conn.query_row(
+                "SELECT session_id, key_id FROM image_tasks WHERE id = ?1 LIMIT 1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            conn.execute(
+                r#"
+                INSERT INTO task_events (id, task_id, session_id, key_id, event_kind, payload_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    format!("evt_{}", Uuid::new_v4().simple()),
+                    task_id,
+                    session_id,
+                    key_id,
+                    event_kind,
+                    payload_json,
+                    unix_timestamp_secs(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     /// Creates a signed link and stores only the token hash.
     pub async fn create_signed_link(
         &self,

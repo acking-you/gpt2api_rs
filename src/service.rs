@@ -17,10 +17,15 @@ use uuid::Uuid;
 
 use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
+    config::SmtpConfig,
     models::{
         AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
         ImageSubmissionResult, ImageTaskRecord, MessageRecord, MessageStatus, ProxyConfigRecord,
         SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
+    },
+    notifications::{
+        is_valid_notification_email, render_image_done_email, send_rendered_email,
+        NotificationOutcome,
     },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
@@ -252,6 +257,7 @@ pub struct AppService {
     storage: Storage,
     admin_token: String,
     upstream: ChatgptUpstreamClient,
+    smtp_config: SmtpConfig,
     key_scheduler: Arc<LocalRequestScheduler>,
     account_scheduler: Arc<LocalRequestScheduler>,
 }
@@ -267,6 +273,7 @@ impl AppService {
             storage,
             admin_token,
             upstream,
+            smtp_config: SmtpConfig::from_env(),
             key_scheduler: Arc::new(LocalRequestScheduler::default()),
             account_scheduler: Arc::new(LocalRequestScheduler::default()),
         };
@@ -1438,7 +1445,69 @@ impl AppService {
         self.storage
             .control
             .mark_image_task_succeeded(&task.id, unix_timestamp_secs(), &artifact_ids)
-            .await
+            .await?;
+        self.send_image_done_notification(&key, task, &artifacts).await?;
+        Ok(())
+    }
+
+    async fn send_image_done_notification(
+        &self,
+        key: &ApiKeyRecord,
+        task: &ImageTaskRecord,
+        artifacts: &[crate::models::ImageArtifactRecord],
+    ) -> Result<()> {
+        if !key.notification_enabled {
+            return Ok(());
+        }
+        let Some(email) = key
+            .notification_email
+            .as_deref()
+            .filter(|value| !value.trim().is_empty() && is_valid_notification_email(value))
+        else {
+            return Ok(());
+        };
+        if !self.smtp_config.is_complete() {
+            return Ok(());
+        }
+        let Some(session) = self.storage.control.get_session_for_admin(&task.session_id).await?
+        else {
+            return Ok(());
+        };
+        let config = self.storage.control.get_runtime_config().await?;
+        let link = self
+            .storage
+            .control
+            .create_signed_link(
+                "image_task",
+                &task.id,
+                unix_timestamp_secs(),
+                config.signed_link_ttl_seconds,
+            )
+            .await?;
+        let base_url = self.smtp_config.public_base_url.as_deref().unwrap_or_default().trim();
+        let signed_link =
+            format!("{}/gpt2api/share/{}", base_url.trim_end_matches('/'), link.plaintext_token);
+        let rendered = render_image_done_email(
+            &session.title,
+            &task.prompt,
+            &task.model,
+            artifacts.len(),
+            &signed_link,
+        );
+        match send_rendered_email(&self.smtp_config, email, &rendered).await {
+            Ok(NotificationOutcome::Sent | NotificationOutcome::Skipped) => Ok(()),
+            Err(error) => {
+                self.storage
+                    .control
+                    .append_task_event(
+                        &task.id,
+                        "notification_failed",
+                        json!({ "error": error.to_string() }),
+                    )
+                    .await?;
+                Ok(())
+            }
+        }
     }
 
     async fn execute_public_image_request(

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use gpt2api_rs::{
     config::ResolvedPaths,
-    models::{AccountRecord, ApiKeyRecord},
+    models::{AccountRecord, ApiKeyRecord, ApiKeyRole},
     service::AppService,
     storage::Storage,
     upstream::chatgpt::ChatgptUpstreamClient,
@@ -76,6 +76,9 @@ async fn auto_route_honors_account_group_subset_before_global_quota_ordering() {
         account_group_id: Some("group-beta".to_string()),
         request_max_concurrency: None,
         request_min_start_interval_ms: None,
+        role: ApiKeyRole::User,
+        notification_email: None,
+        notification_enabled: false,
     };
     storage.control.upsert_api_key(&key).await.expect("seed key");
 

@@ -65,7 +65,10 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             route_strategy TEXT NOT NULL,
             account_group_id TEXT,
             request_max_concurrency INTEGER,
-            request_min_start_interval_ms INTEGER
+            request_min_start_interval_ms INTEGER,
+            role TEXT NOT NULL DEFAULT 'user',
+            notification_email TEXT,
+            notification_enabled INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS runtime_config (
@@ -76,7 +79,10 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             default_request_max_concurrency INTEGER NOT NULL,
             default_request_min_start_interval_ms INTEGER NOT NULL,
             event_flush_batch_size INTEGER NOT NULL,
-            event_flush_interval_seconds INTEGER NOT NULL
+            event_flush_interval_seconds INTEGER NOT NULL,
+            global_image_concurrency INTEGER NOT NULL DEFAULT 1,
+            signed_link_ttl_seconds INTEGER NOT NULL DEFAULT 604800,
+            queue_eta_window_size INTEGER NOT NULL DEFAULT 20
         );
 
         CREATE TABLE IF NOT EXISTS event_outbox (
@@ -88,6 +94,9 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_runtime_config_product_columns(conn)?;
+    ensure_runtime_config_row(conn)?;
+    bootstrap_product_tables(conn)?;
     ensure_account_column(
         conn,
         "quota_known",
@@ -105,6 +114,7 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
     )?;
     ensure_api_key_call_quota_columns(conn)?;
     ensure_api_key_secret_plaintext_column(conn)?;
+    ensure_api_key_product_columns(conn)?;
     Ok(())
 }
 
@@ -187,6 +197,176 @@ fn ensure_api_key_secret_plaintext_column(conn: &SqliteConnection) -> Result<()>
     Ok(())
 }
 
+fn ensure_api_key_product_columns(conn: &SqliteConnection) -> Result<()> {
+    let columns = table_columns(conn, "api_keys")?;
+    if !columns.iter().any(|column| column == "role") {
+        conn.execute_batch("ALTER TABLE api_keys ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")?;
+    }
+    if !columns.iter().any(|column| column == "notification_email") {
+        conn.execute_batch("ALTER TABLE api_keys ADD COLUMN notification_email TEXT")?;
+    }
+    if !columns.iter().any(|column| column == "notification_enabled") {
+        conn.execute_batch(
+            "ALTER TABLE api_keys ADD COLUMN notification_enabled INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_runtime_config_product_columns(conn: &SqliteConnection) -> Result<()> {
+    let columns = table_columns(conn, "runtime_config")?;
+    if !columns.iter().any(|column| column == "global_image_concurrency") {
+        conn.execute_batch(
+            "ALTER TABLE runtime_config ADD COLUMN global_image_concurrency INTEGER NOT NULL DEFAULT 1",
+        )?;
+    }
+    if !columns.iter().any(|column| column == "signed_link_ttl_seconds") {
+        conn.execute_batch(
+            "ALTER TABLE runtime_config ADD COLUMN signed_link_ttl_seconds INTEGER NOT NULL DEFAULT 604800",
+        )?;
+    }
+    if !columns.iter().any(|column| column == "queue_eta_window_size") {
+        conn.execute_batch(
+            "ALTER TABLE runtime_config ADD COLUMN queue_eta_window_size INTEGER NOT NULL DEFAULT 20",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_runtime_config_row(conn: &SqliteConnection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        INSERT OR IGNORE INTO runtime_config (
+            id,
+            refresh_min_seconds,
+            refresh_max_seconds,
+            refresh_jitter_seconds,
+            default_request_max_concurrency,
+            default_request_min_start_interval_ms,
+            event_flush_batch_size,
+            event_flush_interval_seconds,
+            global_image_concurrency,
+            signed_link_ttl_seconds,
+            queue_eta_window_size
+        ) VALUES (
+            1,
+            300,
+            900,
+            60,
+            1,
+            0,
+            100,
+            5,
+            1,
+            604800,
+            20
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn bootstrap_product_tables(conn: &SqliteConnection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY NOT NULL,
+            key_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_message_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_key_updated ON sessions(key_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_sessions_source_updated ON sessions(source, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_sessions_status_updated ON sessions(status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_key_created ON messages(key_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS image_tasks (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            model TEXT NOT NULL,
+            n INTEGER NOT NULL,
+            request_json TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            queue_entered_at INTEGER NOT NULL,
+            started_at INTEGER,
+            finished_at INTEGER,
+            position_snapshot INTEGER,
+            estimated_start_after_ms INTEGER,
+            error_code TEXT,
+            error_message TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_image_tasks_status_queue ON image_tasks(status, queue_entered_at);
+        CREATE INDEX IF NOT EXISTS idx_image_tasks_key_queue ON image_tasks(key_id, queue_entered_at);
+        CREATE INDEX IF NOT EXISTS idx_image_tasks_session_queue ON image_tasks(session_id, queue_entered_at);
+
+        CREATE TABLE IF NOT EXISTS task_events (
+            id TEXT PRIMARY KEY NOT NULL,
+            task_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_events_task_created ON task_events(task_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_task_events_session_created ON task_events(session_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS image_artifacts (
+            id TEXT PRIMARY KEY NOT NULL,
+            task_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            revised_prompt TEXT,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_image_artifacts_task_created ON image_artifacts(task_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_image_artifacts_session_created ON image_artifacts(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_image_artifacts_key_created ON image_artifacts(key_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS signed_links (
+            id TEXT PRIMARY KEY NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            scope TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            revoked_at INTEGER,
+            created_at INTEGER NOT NULL,
+            used_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_signed_links_scope ON signed_links(scope, scope_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn table_columns(conn: &SqliteConnection, table_name: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -200,6 +380,18 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
     } else {
         "NULL"
     };
+    let select_role = if columns.iter().any(|column| column == "role") { "role" } else { "'user'" };
+    let select_notification_email = if columns.iter().any(|column| column == "notification_email") {
+        "notification_email"
+    } else {
+        "NULL"
+    };
+    let select_notification_enabled =
+        if columns.iter().any(|column| column == "notification_enabled") {
+            "notification_enabled"
+        } else {
+            "0"
+        };
     let sql = format!(
         r#"
         BEGIN IMMEDIATE;
@@ -215,7 +407,10 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
             route_strategy TEXT NOT NULL,
             account_group_id TEXT,
             request_max_concurrency INTEGER,
-            request_min_start_interval_ms INTEGER
+            request_min_start_interval_ms INTEGER,
+            role TEXT NOT NULL DEFAULT 'user',
+            notification_email TEXT,
+            notification_enabled INTEGER NOT NULL DEFAULT 0
         );
         INSERT INTO api_keys__new (
             id,
@@ -228,7 +423,10 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
             route_strategy,
             account_group_id,
             request_max_concurrency,
-            request_min_start_interval_ms
+            request_min_start_interval_ms,
+            role,
+            notification_email,
+            notification_enabled
         )
         SELECT
             id,
@@ -241,7 +439,10 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
             route_strategy,
             account_group_id,
             request_max_concurrency,
-            request_min_start_interval_ms
+            request_min_start_interval_ms,
+            {select_role},
+            {select_notification_email},
+            {select_notification_enabled}
         FROM api_keys;
         DROP TABLE api_keys;
         ALTER TABLE api_keys__new RENAME TO api_keys;

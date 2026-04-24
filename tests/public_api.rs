@@ -9,7 +9,7 @@ use axum::{
 use gpt2api_rs::{
     app::build_router,
     config::ResolvedPaths,
-    models::{AccountRecord, ApiKeyRecord},
+    models::{AccountRecord, ApiKeyRecord, ApiKeyRole},
     service::AppService,
     storage::Storage,
     upstream::chatgpt::ChatgptUpstreamClient,
@@ -123,6 +123,9 @@ async fn login_backfills_plaintext_for_legacy_hash_only_keys() {
             account_group_id: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            role: ApiKeyRole::User,
+            notification_email: None,
+            notification_enabled: false,
         })
         .await
         .expect("seed legacy key");

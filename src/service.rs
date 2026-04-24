@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
     models::{
-        AccountMetadata, AccountRecord, ApiKeyRecord, BrowserProfile, ProxyConfigRecord,
-        UsageEventRecord,
+        AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
+        ProxyConfigRecord, UsageEventRecord,
     },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
@@ -521,6 +521,9 @@ impl AppService {
             account_group_id: normalize_optional_string(input.account_group_id.as_deref()),
             request_max_concurrency: input.request_max_concurrency,
             request_min_start_interval_ms: input.request_min_start_interval_ms,
+            role: ApiKeyRole::User,
+            notification_email: None,
+            notification_enabled: false,
         };
         self.storage.control.upsert_api_key(&key).await?;
         Ok(ApiKeySecretRecord { key, secret_plaintext })
@@ -869,6 +872,9 @@ impl AppService {
             account_group_id: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            role: ApiKeyRole::User,
+            notification_email: None,
+            notification_enabled: false,
         };
         self.storage.control.upsert_api_key(&key).await
     }

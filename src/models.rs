@@ -184,6 +184,328 @@ pub struct ProxyConfigRecord {
     pub updated_at: i64,
 }
 
+/// Product role assigned to a downstream API key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyRole {
+    /// Normal user scoped to their own sessions and artifacts.
+    User,
+    /// Product administrator with cross-key visibility and queue controls.
+    Admin,
+}
+
+impl ApiKeyRole {
+    /// Returns the stable SQLite representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// Parses the stable SQLite representation.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "user" => Some(Self::User),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+}
+
+/// Durable session source.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSource {
+    /// Created by the standalone web UI.
+    Web,
+    /// Created by OpenAI-compatible API calls.
+    Api,
+}
+
+impl SessionSource {
+    /// Returns the stable SQLite representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Api => "api",
+        }
+    }
+
+    /// Parses the stable SQLite representation.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "web" => Some(Self::Web),
+            "api" => Some(Self::Api),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted session row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// Stable session id.
+    pub id: String,
+    /// Owning API-key id.
+    pub key_id: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Session source.
+    pub source: SessionSource,
+    /// Active or archived.
+    pub status: String,
+    /// Creation epoch seconds.
+    pub created_at: i64,
+    /// Update epoch seconds.
+    pub updated_at: i64,
+    /// Last message epoch seconds.
+    pub last_message_at: Option<i64>,
+}
+
+/// Message lifecycle status.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageStatus {
+    /// Created but no assistant content yet.
+    Pending,
+    /// Text stream is currently being forwarded.
+    Streaming,
+    /// Message is complete.
+    Done,
+    /// Message failed.
+    Failed,
+}
+
+impl MessageStatus {
+    /// Returns the stable SQLite representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Streaming => "streaming",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parses the stable SQLite representation.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "streaming" => Some(Self::Streaming),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted message row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageRecord {
+    /// Stable message id.
+    pub id: String,
+    /// Parent session id.
+    pub session_id: String,
+    /// Owning API-key id.
+    pub key_id: String,
+    /// Conversation role.
+    pub role: String,
+    /// Structured content JSON string.
+    pub content_json: String,
+    /// Message status.
+    pub status: MessageStatus,
+    /// Creation epoch seconds.
+    pub created_at: i64,
+    /// Update epoch seconds.
+    pub updated_at: i64,
+}
+
+/// Image task lifecycle status.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageTaskStatus {
+    /// Waiting in the global queue.
+    Queued,
+    /// Claimed by a worker.
+    Running,
+    /// Artifacts were written successfully.
+    Succeeded,
+    /// Upstream or local processing failed.
+    Failed,
+    /// Cancelled before execution.
+    Cancelled,
+}
+
+impl ImageTaskStatus {
+    /// Returns the stable SQLite representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses the stable SQLite representation.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted image task row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageTaskRecord {
+    /// Stable task id.
+    pub id: String,
+    /// Parent session id.
+    pub session_id: String,
+    /// Assistant message id updated by this task.
+    pub message_id: String,
+    /// Owning API-key id.
+    pub key_id: String,
+    /// Task status.
+    pub status: ImageTaskStatus,
+    /// Generation or edit mode.
+    pub mode: String,
+    /// Original user prompt.
+    pub prompt: String,
+    /// Requested model.
+    pub model: String,
+    /// Requested image count.
+    pub n: i64,
+    /// Original request JSON.
+    pub request_json: String,
+    /// UI phase such as queued, allocating, running, saving, done, failed.
+    pub phase: String,
+    /// Queue entry epoch seconds.
+    pub queue_entered_at: i64,
+    /// Start epoch seconds.
+    pub started_at: Option<i64>,
+    /// Finish epoch seconds.
+    pub finished_at: Option<i64>,
+    /// Last known number of queued tasks ahead.
+    pub position_snapshot: Option<i64>,
+    /// Approximate wait in milliseconds.
+    pub estimated_start_after_ms: Option<i64>,
+    /// Stable error code.
+    pub error_code: Option<String>,
+    /// Human-readable error summary.
+    pub error_message: Option<String>,
+}
+
+/// Generated image artifact metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageArtifactRecord {
+    /// Stable artifact id.
+    pub id: String,
+    /// Parent task id.
+    pub task_id: String,
+    /// Parent session id.
+    pub session_id: String,
+    /// Parent message id.
+    pub message_id: String,
+    /// Owning API-key id.
+    pub key_id: String,
+    /// Relative filesystem path under the service root.
+    pub relative_path: String,
+    /// MIME type.
+    pub mime_type: String,
+    /// Hex SHA-256 of the file.
+    pub sha256: String,
+    /// File size in bytes.
+    pub size_bytes: i64,
+    /// Optional image width.
+    pub width: Option<i64>,
+    /// Optional image height.
+    pub height: Option<i64>,
+    /// Upstream revised prompt.
+    pub revised_prompt: Option<String>,
+    /// Creation epoch seconds.
+    pub created_at: i64,
+}
+
+/// Runtime configuration stored in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfigRecord {
+    /// Minimum account refresh interval.
+    pub refresh_min_seconds: i64,
+    /// Maximum account refresh interval.
+    pub refresh_max_seconds: i64,
+    /// Refresh jitter.
+    pub refresh_jitter_seconds: i64,
+    /// Default per-key/account concurrency.
+    pub default_request_max_concurrency: i64,
+    /// Default start interval in milliseconds.
+    pub default_request_min_start_interval_ms: i64,
+    /// Usage outbox flush batch size.
+    pub event_flush_batch_size: i64,
+    /// Usage outbox flush interval.
+    pub event_flush_interval_seconds: i64,
+    /// Global image task concurrency.
+    pub global_image_concurrency: i64,
+    /// Signed link TTL in seconds.
+    pub signed_link_ttl_seconds: i64,
+    /// ETA averaging window size.
+    pub queue_eta_window_size: i64,
+}
+
+/// A signed link row with only hashed token persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedLinkRecord {
+    /// Stable signed link id.
+    pub id: String,
+    /// Hashed plaintext token.
+    pub token_hash: String,
+    /// Link scope such as image_task or session.
+    pub scope: String,
+    /// Scoped record id.
+    pub scope_id: String,
+    /// Expiration epoch seconds.
+    pub expires_at: i64,
+    /// Revocation epoch seconds.
+    pub revoked_at: Option<i64>,
+    /// Creation epoch seconds.
+    pub created_at: i64,
+    /// Last observed use epoch seconds.
+    pub used_at: Option<i64>,
+}
+
+/// Created signed link including the one-time plaintext token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreatedSignedLink {
+    /// Persisted signed link row.
+    #[serde(flatten)]
+    pub record: SignedLinkRecord,
+    /// Plaintext token to embed in the outgoing URL.
+    pub plaintext_token: String,
+}
+
+impl std::ops::Deref for CreatedSignedLink {
+    type Target = SignedLinkRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
 /// Persisted downstream API-key record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
@@ -212,6 +534,12 @@ pub struct ApiKeyRecord {
     pub request_max_concurrency: Option<u64>,
     /// Optional per-key minimum start interval in milliseconds.
     pub request_min_start_interval_ms: Option<u64>,
+    /// Product role.
+    pub role: ApiKeyRole,
+    /// Optional default notification email.
+    pub notification_email: Option<String>,
+    /// Whether completion email notifications are enabled.
+    pub notification_enabled: bool,
 }
 
 impl ApiKeyRecord {
@@ -230,6 +558,9 @@ impl ApiKeyRecord {
             account_group_id: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            role: ApiKeyRole::User,
+            notification_email: None,
+            notification_enabled: false,
         }
     }
 }

@@ -13,6 +13,8 @@ pub struct ResolvedPaths {
     pub events_duckdb: PathBuf,
     /// Directory for large event diagnostic sidecars.
     pub event_blobs_dir: PathBuf,
+    /// Directory containing generated image artifacts.
+    pub image_artifacts_dir: PathBuf,
 }
 
 impl ResolvedPaths {
@@ -22,6 +24,7 @@ impl ResolvedPaths {
             control_db: root.join("control.db"),
             events_duckdb: root.join("events.duckdb"),
             event_blobs_dir: root.join("event-blobs"),
+            image_artifacts_dir: root.join("artifacts").join("images"),
             root,
         }
     }

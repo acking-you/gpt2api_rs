@@ -12,5 +12,6 @@ pub mod routing;
 pub mod scheduler;
 pub mod service;
 pub mod storage;
+pub mod tasks;
 pub mod upstream;
 pub mod usage;

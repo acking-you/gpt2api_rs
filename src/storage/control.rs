@@ -13,19 +13,43 @@ use uuid::Uuid;
 use super::migrations::bootstrap_control_schema;
 use crate::{
     models::{
-        AccountProxyMode, AccountRecord, ApiKeyRecord, ApiKeyRole, CreatedSignedLink,
-        MessageRecord, MessageStatus, ProxyConfigRecord, RuntimeConfigRecord, SessionRecord,
+        AccountProxyMode, AccountRecord, AdminQueueSnapshot, ApiKeyRecord, ApiKeyRole,
+        CreatedSignedLink, ImageArtifactRecord, ImageTaskRecord, ImageTaskStatus, MessageRecord,
+        MessageStatus, ProxyConfigRecord, QueueSnapshot, RuntimeConfigRecord, SessionRecord,
         SessionSource, SignedLinkRecord, UsageEventRecord,
     },
     storage::outbox::OutboxRow,
 };
 
 const API_KEY_COLUMNS: &str = "id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms, role, notification_email, notification_enabled";
+const IMAGE_TASK_COLUMNS: &str = "id, session_id, message_id, key_id, status, mode, prompt, model, n, request_json, phase, queue_entered_at, started_at, finished_at, position_snapshot, estimated_start_after_ms, error_code, error_message";
+const IMAGE_ARTIFACT_COLUMNS: &str = "id, task_id, session_id, message_id, key_id, relative_path, mime_type, sha256, size_bytes, width, height, revised_prompt, created_at";
 
 /// SQLite wrapper for control-plane reads and writes.
 #[derive(Debug, Clone)]
 pub struct ControlDb {
     path: PathBuf,
+}
+
+/// Input required to create one queued image task.
+#[derive(Debug, Clone)]
+pub struct CreateImageTaskInput<'a> {
+    /// Parent session id.
+    pub session_id: &'a str,
+    /// Assistant message id updated by this task.
+    pub message_id: &'a str,
+    /// Owning API-key id.
+    pub key_id: &'a str,
+    /// Generation or edit mode.
+    pub mode: &'a str,
+    /// Original user prompt.
+    pub prompt: &'a str,
+    /// Requested model.
+    pub model: &'a str,
+    /// Requested image count.
+    pub n: i64,
+    /// Original request JSON.
+    pub request_json: serde_json::Value,
 }
 
 fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
@@ -157,6 +181,79 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> 
     })
 }
 
+fn image_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageTaskRecord> {
+    let status_raw: String = row.get(4)?;
+    let status = ImageTaskStatus::parse(&status_raw)
+        .ok_or_else(|| invalid_text_value(4, &status_raw, "image task status"))?;
+    Ok(ImageTaskRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        message_id: row.get(2)?,
+        key_id: row.get(3)?,
+        status,
+        mode: row.get(5)?,
+        prompt: row.get(6)?,
+        model: row.get(7)?,
+        n: row.get(8)?,
+        request_json: row.get(9)?,
+        phase: row.get(10)?,
+        queue_entered_at: row.get(11)?,
+        started_at: row.get(12)?,
+        finished_at: row.get(13)?,
+        position_snapshot: row.get(14)?,
+        estimated_start_after_ms: row.get(15)?,
+        error_code: row.get(16)?,
+        error_message: row.get(17)?,
+    })
+}
+
+fn image_task_from_row_with_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<ImageTaskRecord> {
+    let status_raw: String = row.get(offset + 4)?;
+    let status = ImageTaskStatus::parse(&status_raw)
+        .ok_or_else(|| invalid_text_value(offset + 4, &status_raw, "image task status"))?;
+    Ok(ImageTaskRecord {
+        id: row.get(offset)?,
+        session_id: row.get(offset + 1)?,
+        message_id: row.get(offset + 2)?,
+        key_id: row.get(offset + 3)?,
+        status,
+        mode: row.get(offset + 5)?,
+        prompt: row.get(offset + 6)?,
+        model: row.get(offset + 7)?,
+        n: row.get(offset + 8)?,
+        request_json: row.get(offset + 9)?,
+        phase: row.get(offset + 10)?,
+        queue_entered_at: row.get(offset + 11)?,
+        started_at: row.get(offset + 12)?,
+        finished_at: row.get(offset + 13)?,
+        position_snapshot: row.get(offset + 14)?,
+        estimated_start_after_ms: row.get(offset + 15)?,
+        error_code: row.get(offset + 16)?,
+        error_message: row.get(offset + 17)?,
+    })
+}
+
+fn image_artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageArtifactRecord> {
+    Ok(ImageArtifactRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        session_id: row.get(2)?,
+        message_id: row.get(3)?,
+        key_id: row.get(4)?,
+        relative_path: row.get(5)?,
+        mime_type: row.get(6)?,
+        sha256: row.get(7)?,
+        size_bytes: row.get(8)?,
+        width: row.get(9)?,
+        height: row.get(10)?,
+        revised_prompt: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
 fn signed_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedLinkRecord> {
     Ok(SignedLinkRecord {
         id: row.get(0)?,
@@ -204,6 +301,15 @@ fn sha256_hex(value: &str) -> String {
 fn unix_timestamp_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_secs()
         as i64
+}
+
+fn list_tasks_by_status(conn: &Connection, status: &str) -> Result<Vec<ImageTaskRecord>> {
+    let sql = format!(
+        "SELECT {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE status = ?1 ORDER BY queue_entered_at ASC, rowid ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([status], image_task_from_row)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 impl ControlDb {
@@ -988,6 +1094,512 @@ impl ControlDb {
             )?;
             let rows = stmt.query_map([session_id], message_from_row)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
+    /// Creates one queued image task.
+    pub async fn create_image_task(
+        &self,
+        input: CreateImageTaskInput<'_>,
+    ) -> Result<ImageTaskRecord> {
+        let path = self.path.clone();
+        let session_id = input.session_id.to_string();
+        let message_id = input.message_id.to_string();
+        let key_id = input.key_id.to_string();
+        let mode = input.mode.to_string();
+        let prompt = input.prompt.to_string();
+        let model = input.model.to_string();
+        let n = input.n;
+        let request_json = serde_json::to_string(&input.request_json)?;
+        tokio::task::spawn_blocking(move || -> Result<ImageTaskRecord> {
+            let conn = Connection::open(path)?;
+            let now = unix_timestamp_secs();
+            let task = ImageTaskRecord {
+                id: format!("task_{}", Uuid::new_v4().simple()),
+                session_id,
+                message_id,
+                key_id,
+                status: ImageTaskStatus::Queued,
+                mode,
+                prompt,
+                model,
+                n: n.max(1),
+                request_json,
+                phase: "queued".to_string(),
+                queue_entered_at: now,
+                started_at: None,
+                finished_at: None,
+                position_snapshot: None,
+                estimated_start_after_ms: None,
+                error_code: None,
+                error_message: None,
+            };
+            conn.execute(
+                r#"
+                INSERT INTO image_tasks (
+                    id, session_id, message_id, key_id, status, mode, prompt, model, n,
+                    request_json, phase, queue_entered_at, started_at, finished_at,
+                    position_snapshot, estimated_start_after_ms, error_code, error_message
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                "#,
+                params![
+                    &task.id,
+                    &task.session_id,
+                    &task.message_id,
+                    &task.key_id,
+                    task.status.as_str(),
+                    &task.mode,
+                    &task.prompt,
+                    &task.model,
+                    task.n,
+                    &task.request_json,
+                    &task.phase,
+                    task.queue_entered_at,
+                    &task.started_at,
+                    &task.finished_at,
+                    &task.position_snapshot,
+                    &task.estimated_start_after_ms,
+                    &task.error_code,
+                    &task.error_message,
+                ],
+            )?;
+            Ok(task)
+        })
+        .await?
+    }
+
+    /// Fetches one image task by id.
+    pub async fn get_image_task(&self, task_id: &str) -> Result<Option<ImageTaskRecord>> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ImageTaskRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!("SELECT {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE id = ?1 LIMIT 1");
+            let mut stmt = conn.prepare(&sql)?;
+            optional_row(stmt.query_row([task_id], image_task_from_row))
+        })
+        .await?
+    }
+
+    /// Fetches one image task owned by a key.
+    pub async fn get_image_task_for_key(
+        &self,
+        task_id: &str,
+        key_id: &str,
+    ) -> Result<Option<ImageTaskRecord>> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        let key_id = key_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ImageTaskRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE id = ?1 AND key_id = ?2 LIMIT 1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            optional_row(stmt.query_row(params![task_id, key_id], image_task_from_row))
+        })
+        .await?
+    }
+
+    /// Lists image tasks for one session in queue order.
+    pub async fn list_tasks_for_session(&self, session_id: &str) -> Result<Vec<ImageTaskRecord>> {
+        let path = self.path.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ImageTaskRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE session_id = ?1 ORDER BY queue_entered_at ASC, rowid ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([session_id], image_task_from_row)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
+    /// Lists image artifacts for one session in creation order.
+    pub async fn list_artifacts_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ImageArtifactRecord>> {
+        let path = self.path.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ImageArtifactRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT {IMAGE_ARTIFACT_COLUMNS} FROM image_artifacts WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([session_id], image_artifact_from_row)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
+    /// Inserts image artifact metadata.
+    pub async fn insert_image_artifact(&self, artifact: &ImageArtifactRecord) -> Result<()> {
+        let path = self.path.clone();
+        let artifact = artifact.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = Connection::open(path)?;
+            conn.execute(
+                r#"
+                INSERT INTO image_artifacts (
+                    id, task_id, session_id, message_id, key_id, relative_path, mime_type,
+                    sha256, size_bytes, width, height, revised_prompt, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    &artifact.id,
+                    &artifact.task_id,
+                    &artifact.session_id,
+                    &artifact.message_id,
+                    &artifact.key_id,
+                    &artifact.relative_path,
+                    &artifact.mime_type,
+                    &artifact.sha256,
+                    artifact.size_bytes,
+                    &artifact.width,
+                    &artifact.height,
+                    &artifact.revised_prompt,
+                    artifact.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Fetches one image artifact.
+    pub async fn get_image_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<ImageArtifactRecord>> {
+        let path = self.path.clone();
+        let artifact_id = artifact_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ImageArtifactRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT {IMAGE_ARTIFACT_COLUMNS} FROM image_artifacts WHERE id = ?1 LIMIT 1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            optional_row(stmt.query_row([artifact_id], image_artifact_from_row))
+        })
+        .await?
+    }
+
+    /// Claims the next queued image task when global concurrency allows.
+    pub async fn claim_next_image_task(
+        &self,
+        global_limit: i64,
+        started_at: i64,
+    ) -> Result<Option<ImageTaskRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<ImageTaskRecord>> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            let running_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM image_tasks WHERE status = 'running'",
+                [],
+                |row| row.get(0),
+            )?;
+            if running_count >= global_limit.max(1) {
+                return Ok(None);
+            }
+            let task_id = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM image_tasks WHERE status = 'queued' ORDER BY queue_entered_at ASC, rowid ASC LIMIT 1",
+                )?;
+                optional_row(stmt.query_row([], |row| row.get::<_, String>(0)))?
+            };
+            let Some(task_id) = task_id else {
+                return Ok(None);
+            };
+            tx.execute(
+                r#"
+                UPDATE image_tasks
+                SET status = 'running', phase = 'allocating', started_at = ?1
+                WHERE id = ?2 AND status = 'queued'
+                "#,
+                params![started_at, &task_id],
+            )?;
+            let task = {
+                let sql = format!("SELECT {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE id = ?1 LIMIT 1");
+                let mut stmt = tx.prepare(&sql)?;
+                stmt.query_row([task_id], image_task_from_row)?
+            };
+            tx.commit()?;
+            Ok(Some(task))
+        })
+        .await?
+    }
+
+    /// Updates the visible phase for one image task and appends an event.
+    pub async fn mark_image_task_phase(
+        &self,
+        task_id: &str,
+        phase: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        let phase = phase.to_string();
+        let payload_json = serde_json::to_string(&payload)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE image_tasks SET phase = ?1 WHERE id = ?2",
+                params![&phase, &task_id],
+            )?;
+            let (session_id, key_id): (String, String) = tx.query_row(
+                "SELECT session_id, key_id FROM image_tasks WHERE id = ?1 LIMIT 1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO task_events (id, task_id, session_id, key_id, event_kind, payload_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, 'phase', ?5, ?6)
+                "#,
+                params![
+                    format!("evt_{}", Uuid::new_v4().simple()),
+                    &task_id,
+                    session_id,
+                    key_id,
+                    payload_json,
+                    unix_timestamp_secs(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Marks one task as succeeded.
+    pub async fn mark_image_task_succeeded(
+        &self,
+        task_id: &str,
+        finished_at: i64,
+        artifact_ids: &[String],
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        let artifact_ids = artifact_ids.to_vec();
+        let payload_json =
+            serde_json::to_string(&serde_json::json!({ "artifact_ids": artifact_ids }))?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                r#"
+                UPDATE image_tasks
+                SET status = 'succeeded', phase = 'done', finished_at = ?1, error_code = NULL, error_message = NULL
+                WHERE id = ?2
+                "#,
+                params![finished_at, &task_id],
+            )?;
+            let (session_id, key_id): (String, String) = tx.query_row(
+                "SELECT session_id, key_id FROM image_tasks WHERE id = ?1 LIMIT 1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO task_events (id, task_id, session_id, key_id, event_kind, payload_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?6)
+                "#,
+                params![
+                    format!("evt_{}", Uuid::new_v4().simple()),
+                    &task_id,
+                    session_id,
+                    key_id,
+                    payload_json,
+                    finished_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Marks one task as failed.
+    pub async fn mark_image_task_failed(
+        &self,
+        task_id: &str,
+        finished_at: i64,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        let error_code = error_code.to_string();
+        let error_message = error_message.to_string();
+        let payload_json = serde_json::to_string(
+            &serde_json::json!({ "error_code": &error_code, "error_message": &error_message }),
+        )?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                r#"
+                UPDATE image_tasks
+                SET status = 'failed', phase = 'failed', finished_at = ?1, error_code = ?2, error_message = ?3
+                WHERE id = ?4
+                "#,
+                params![finished_at, &error_code, &error_message, &task_id],
+            )?;
+            let (session_id, key_id): (String, String) = tx.query_row(
+                "SELECT session_id, key_id FROM image_tasks WHERE id = ?1 LIMIT 1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO task_events (id, task_id, session_id, key_id, event_kind, payload_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, 'failed', ?5, ?6)
+                "#,
+                params![
+                    format!("evt_{}", Uuid::new_v4().simple()),
+                    &task_id,
+                    session_id,
+                    key_id,
+                    payload_json,
+                    finished_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Cancels one queued image task.
+    pub async fn cancel_queued_image_task(
+        &self,
+        task_id: &str,
+        key_id: Option<&str>,
+    ) -> Result<bool> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        let key_id = key_id.map(ToString::to_string);
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            let finished_at = unix_timestamp_secs();
+            let changed = match key_id {
+                Some(key_id) => tx.execute(
+                    "UPDATE image_tasks SET status = 'cancelled', phase = 'cancelled', finished_at = ?1 WHERE id = ?2 AND key_id = ?3 AND status = 'queued'",
+                    params![finished_at, &task_id, key_id],
+                )?,
+                None => tx.execute(
+                    "UPDATE image_tasks SET status = 'cancelled', phase = 'cancelled', finished_at = ?1 WHERE id = ?2 AND status = 'queued'",
+                    params![finished_at, &task_id],
+                )?,
+            };
+            if changed > 0 {
+                let (session_id, key_id): (String, String) = tx.query_row(
+                    "SELECT session_id, key_id FROM image_tasks WHERE id = ?1 LIMIT 1",
+                    [&task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                tx.execute(
+                    r#"
+                    INSERT INTO task_events (id, task_id, session_id, key_id, event_kind, payload_json, created_at)
+                    VALUES (?1, ?2, ?3, ?4, 'cancelled', ?5, ?6)
+                    "#,
+                    params![
+                        format!("evt_{}", Uuid::new_v4().simple()),
+                        &task_id,
+                        session_id,
+                        key_id,
+                        serde_json::json!({ "phase": "cancelled" }).to_string(),
+                        finished_at,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed > 0)
+        })
+        .await?
+    }
+
+    /// Returns a queue snapshot for one task.
+    pub async fn queue_snapshot_for_task(&self, task_id: &str) -> Result<QueueSnapshot> {
+        let path = self.path.clone();
+        let task_id = task_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<QueueSnapshot> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT rowid, {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE id = ?1 LIMIT 1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let (target_rowid, task): (i64, ImageTaskRecord) = stmt
+                .query_row([&task_id], |row| {
+                    Ok((row.get(0)?, image_task_from_row_with_offset(row, 1)?))
+                })?;
+            let position_ahead = if task.status == ImageTaskStatus::Queued {
+                conn.query_row(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM image_tasks
+                    WHERE status = 'queued'
+                      AND (
+                        queue_entered_at < ?1
+                        OR (queue_entered_at = ?1 AND rowid < ?2)
+                      )
+                    "#,
+                    params![task.queue_entered_at, target_rowid],
+                    |row| row.get(0),
+                )?
+            } else {
+                0
+            };
+            Ok(QueueSnapshot { task, position_ahead, estimated_start_after_ms: None })
+        })
+        .await?
+    }
+
+    /// Returns an admin-visible queue snapshot.
+    pub async fn queue_snapshot_admin(&self) -> Result<AdminQueueSnapshot> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<AdminQueueSnapshot> {
+            let conn = Connection::open(path)?;
+            let config = {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT
+                        refresh_min_seconds,
+                        refresh_max_seconds,
+                        refresh_jitter_seconds,
+                        default_request_max_concurrency,
+                        default_request_min_start_interval_ms,
+                        event_flush_batch_size,
+                        event_flush_interval_seconds,
+                        global_image_concurrency,
+                        signed_link_ttl_seconds,
+                        queue_eta_window_size
+                    FROM runtime_config
+                    WHERE id = 1
+                    LIMIT 1
+                    "#,
+                )?;
+                stmt.query_row([], runtime_config_from_row)?
+            };
+            let running = list_tasks_by_status(&conn, "running")?;
+            let queued = list_tasks_by_status(&conn, "queued")?;
+            Ok(AdminQueueSnapshot {
+                running,
+                queued,
+                global_image_concurrency: config.global_image_concurrency,
+            })
         })
         .await?
     }

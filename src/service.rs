@@ -17,8 +17,9 @@ use uuid::Uuid;
 use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
     models::{
-        AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
-        ProxyConfigRecord, SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
+        AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile, ImageTaskRecord,
+        MessageStatus, ProxyConfigRecord, SessionDetail, SessionRecord, SessionSource,
+        UsageEventRecord,
     },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
@@ -968,7 +969,130 @@ impl AppService {
 
     async fn build_session_detail(&self, session: SessionRecord) -> Result<SessionDetail> {
         let messages = self.storage.control.list_messages_for_session(&session.id).await?;
-        Ok(SessionDetail { session, messages, tasks: Vec::new(), artifacts: Vec::new() })
+        let tasks = self.storage.control.list_tasks_for_session(&session.id).await?;
+        let artifacts = self.storage.control.list_artifacts_for_session(&session.id).await?;
+        Ok(SessionDetail { session, messages, tasks, artifacts })
+    }
+
+    /// Executes a queue-claimed image task and persists its artifacts.
+    pub async fn execute_claimed_image_task(&self, task: ImageTaskRecord) -> Result<()> {
+        match self.execute_claimed_image_task_inner(&task).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let error_message = error.to_string();
+                let _ = self
+                    .storage
+                    .control
+                    .mark_image_task_failed(
+                        &task.id,
+                        unix_timestamp_secs(),
+                        "image_task_failed",
+                        &error_message,
+                    )
+                    .await;
+                let _ = self
+                    .storage
+                    .control
+                    .update_message_content_status(
+                        &task.message_id,
+                        json!({
+                            "blocks": [{
+                                "type": "error",
+                                "text": error_message,
+                            }],
+                        }),
+                        MessageStatus::Failed,
+                    )
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_claimed_image_task_inner(&self, task: &ImageTaskRecord) -> Result<()> {
+        let Some(key) = self.storage.control.get_api_key(&task.key_id).await? else {
+            bail!("api key not found for image task");
+        };
+        if key.status != "active" {
+            bail!("api key is disabled");
+        }
+        if task.mode != "generation" {
+            bail!("unsupported image task mode: {}", task.mode);
+        }
+
+        self.storage
+            .control
+            .mark_image_task_phase(&task.id, "allocating", json!({ "phase": "allocating" }))
+            .await?;
+        self.storage
+            .control
+            .mark_image_task_phase(&task.id, "running", json!({ "phase": "running" }))
+            .await?;
+        let result = self
+            .execute_public_image_request(
+                &key,
+                &task.prompt,
+                &task.model,
+                task.n.max(1) as usize,
+                None,
+                "/v1/images/generations",
+            )
+            .await?;
+        self.storage
+            .control
+            .mark_image_task_phase(&task.id, "saving", json!({ "phase": "saving" }))
+            .await?;
+
+        let mut artifacts = Vec::new();
+        for (index, item) in result.data.iter().enumerate() {
+            let artifact = self
+                .storage
+                .artifacts
+                .write_generated_image(
+                    &task.id,
+                    &task.session_id,
+                    &task.message_id,
+                    &task.key_id,
+                    item,
+                    index,
+                )
+                .await?;
+            self.storage.control.insert_image_artifact(&artifact).await?;
+            artifacts.push(artifact);
+        }
+
+        let artifact_ids: Vec<String> =
+            artifacts.iter().map(|artifact| artifact.id.clone()).collect();
+        let blocks: Vec<Value> = artifacts
+            .iter()
+            .map(|artifact| {
+                json!({
+                    "type": "image",
+                    "artifact_id": artifact.id,
+                    "mime_type": artifact.mime_type,
+                    "relative_path": artifact.relative_path,
+                    "width": artifact.width,
+                    "height": artifact.height,
+                    "revised_prompt": artifact.revised_prompt,
+                })
+            })
+            .collect();
+        self.storage
+            .control
+            .update_message_content_status(
+                &task.message_id,
+                json!({
+                    "blocks": blocks,
+                    "prompt": task.prompt,
+                    "model": result.resolved_model,
+                }),
+                MessageStatus::Done,
+            )
+            .await?;
+        self.storage
+            .control
+            .mark_image_task_succeeded(&task.id, unix_timestamp_secs(), &artifact_ids)
+            .await
     }
 
     async fn execute_public_image_request(

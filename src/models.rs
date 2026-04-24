@@ -424,6 +424,28 @@ pub struct ImageTaskRecord {
     pub error_message: Option<String>,
 }
 
+/// Queue snapshot for one image task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueSnapshot {
+    /// Current task row.
+    pub task: ImageTaskRecord,
+    /// Number of queued tasks that should run before this one.
+    pub position_ahead: i64,
+    /// Approximate start wait in milliseconds.
+    pub estimated_start_after_ms: Option<i64>,
+}
+
+/// Admin-visible queue snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminQueueSnapshot {
+    /// Running task rows.
+    pub running: Vec<ImageTaskRecord>,
+    /// Queued task rows.
+    pub queued: Vec<ImageTaskRecord>,
+    /// Global image concurrency setting.
+    pub global_image_concurrency: i64,
+}
+
 /// Generated image artifact metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageArtifactRecord {

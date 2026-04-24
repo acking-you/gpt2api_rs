@@ -26,6 +26,11 @@ pub fn build_router(service: Arc<AppService>) -> Router {
             "/sessions/:session_id",
             get(product_api::get_session).patch(product_api::patch_session),
         )
+        .route("/sessions/:session_id/events", get(product_api::session_events))
+        .route("/sessions/:session_id/messages", post(product_api::create_message))
+        .route("/sessions/:session_id/messages/edit", post(product_api::create_edit_message))
+        .route("/tasks/:task_id", get(product_api::get_task))
+        .route("/tasks/:task_id/cancel", post(product_api::cancel_task))
         .route("/v1/models", get(public_api::list_models))
         .route("/v1/images/generations", post(public_api::generate_images))
         .route("/v1/images/edits", post(public_api::edit_images))

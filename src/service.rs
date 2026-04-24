@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -17,13 +18,13 @@ use uuid::Uuid;
 use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
     models::{
-        AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile, ImageTaskRecord,
-        MessageStatus, ProxyConfigRecord, SessionDetail, SessionRecord, SessionSource,
-        UsageEventRecord,
+        AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
+        ImageSubmissionResult, ImageTaskRecord, MessageStatus, ProxyConfigRecord, SessionDetail,
+        SessionRecord, SessionSource, UsageEventRecord,
     },
     routing::select_best_candidate,
     scheduler::{Lease, LocalRequestScheduler},
-    storage::Storage,
+    storage::{control::CreateImageTaskInput, Storage},
     upstream::chatgpt::{
         access_token_expires_at, is_token_invalid_error, ChatgptImageResult, ChatgptTextResult,
         ChatgptTextStream, ChatgptUpstreamClient,
@@ -235,6 +236,16 @@ pub struct ApiKeySecretRecord {
     pub secret_plaintext: String,
 }
 
+struct ImageMessageInput<'a> {
+    key: &'a ApiKeyRecord,
+    session_id: &'a str,
+    mode: &'a str,
+    prompt: &'a str,
+    model: &'a str,
+    n: usize,
+    edit_input: Option<ImageEditInput>,
+}
+
 /// Shared runtime service backing public and admin HTTP handlers.
 #[derive(Debug, Clone)]
 pub struct AppService {
@@ -378,6 +389,172 @@ impl AppService {
             return Ok(None);
         };
         Ok(Some(self.build_session_detail(session).await?))
+    }
+
+    /// Appends a user text message, completes it immediately, and returns the session detail.
+    pub async fn submit_text_message(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        text: &str,
+        model: &str,
+    ) -> Result<Option<SessionDetail>> {
+        let Some(session) = self.storage.control.get_session_for_key(session_id, &key.id).await?
+        else {
+            return Ok(None);
+        };
+        let text = normalize_required_string(text, "text")?;
+        let model = normalize_required_string(model, "model")?;
+        let _user_message = self
+            .storage
+            .control
+            .append_message(
+                &session.id,
+                &key.id,
+                "user",
+                text_message_content(&text),
+                MessageStatus::Done,
+            )
+            .await?;
+        let assistant_message = self
+            .storage
+            .control
+            .append_message(
+                &session.id,
+                &key.id,
+                "assistant",
+                json!({ "blocks": [] }),
+                MessageStatus::Pending,
+            )
+            .await?;
+        match self.complete_text_for_key(key, &text, &model, "/sessions/messages").await {
+            Ok(result) => {
+                self.storage
+                    .control
+                    .update_message_content_status(
+                        &assistant_message.id,
+                        text_message_content(&result.text),
+                        MessageStatus::Done,
+                    )
+                    .await?;
+                self.get_session_detail_for_key(key, &session.id).await
+            }
+            Err(error) => {
+                self.storage
+                    .control
+                    .update_message_content_status(
+                        &assistant_message.id,
+                        json!({ "blocks": [{ "type": "error", "text": error.to_string() }] }),
+                        MessageStatus::Failed,
+                    )
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Queues one text-to-image message for a web session.
+    pub async fn submit_image_generation_message(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        prompt: &str,
+        model: &str,
+        n: usize,
+    ) -> Result<Option<ImageSubmissionResult>> {
+        self.submit_image_message(ImageMessageInput {
+            key,
+            session_id,
+            mode: "generation",
+            prompt,
+            model,
+            n,
+            edit_input: None,
+        })
+        .await
+    }
+
+    /// Queues one image-edit message for a web session.
+    pub async fn submit_image_edit_message(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        prompt: &str,
+        model: &str,
+        n: usize,
+        edit_input: ImageEditInput,
+    ) -> Result<Option<ImageSubmissionResult>> {
+        self.submit_image_message(ImageMessageInput {
+            key,
+            session_id,
+            mode: "edit",
+            prompt,
+            model,
+            n,
+            edit_input: Some(edit_input),
+        })
+        .await
+    }
+
+    async fn submit_image_message(
+        &self,
+        input: ImageMessageInput<'_>,
+    ) -> Result<Option<ImageSubmissionResult>> {
+        let key = input.key;
+        let Some(session) =
+            self.storage.control.get_session_for_key(input.session_id, &key.id).await?
+        else {
+            return Ok(None);
+        };
+        let prompt = normalize_required_string(input.prompt, "prompt")?;
+        let model = normalize_required_string(input.model, "model")?;
+        let n = input.n.clamp(1, 4);
+        ensure_key_can_consume(key, n as i64).map_err(|error| anyhow!(error.to_string()))?;
+        let user_message = self
+            .storage
+            .control
+            .append_message(
+                &session.id,
+                &key.id,
+                "user",
+                image_prompt_message_content(input.mode, &prompt, &model, n),
+                MessageStatus::Done,
+            )
+            .await?;
+        let assistant_message = self
+            .storage
+            .control
+            .append_message(
+                &session.id,
+                &key.id,
+                "assistant",
+                json!({ "blocks": [] }),
+                MessageStatus::Pending,
+            )
+            .await?;
+        let request_json =
+            image_task_request_json(input.mode, &prompt, &model, n, input.edit_input.as_ref());
+        let task = self
+            .storage
+            .control
+            .create_image_task(CreateImageTaskInput {
+                session_id: &session.id,
+                message_id: &assistant_message.id,
+                key_id: &key.id,
+                mode: input.mode,
+                prompt: &prompt,
+                model: &model,
+                n: n as i64,
+                request_json,
+            })
+            .await?;
+        let queue = self.storage.control.queue_snapshot_for_task(&task.id).await?;
+        Ok(Some(ImageSubmissionResult {
+            user_message,
+            assistant_message,
+            task: queue.task.clone(),
+            queue,
+        }))
     }
 
     /// Imports accounts and returns the refreshed account list.
@@ -1016,9 +1193,11 @@ impl AppService {
         if key.status != "active" {
             bail!("api key is disabled");
         }
-        if task.mode != "generation" {
-            bail!("unsupported image task mode: {}", task.mode);
-        }
+        let (edit_input, endpoint) = match task.mode.as_str() {
+            "generation" => (None, "/v1/images/generations"),
+            "edit" => (Some(edit_input_for_task(task)?), "/v1/images/edits"),
+            _ => bail!("unsupported image task mode: {}", task.mode),
+        };
 
         self.storage
             .control
@@ -1034,8 +1213,8 @@ impl AppService {
                 &task.prompt,
                 &task.model,
                 task.n.max(1) as usize,
-                None,
-                "/v1/images/generations",
+                edit_input,
+                endpoint,
             )
             .await?;
         self.storage
@@ -1645,6 +1824,68 @@ fn apply_account_metadata(account: &mut AccountRecord, metadata: AccountMetadata
     };
 }
 
+fn text_message_content(text: &str) -> Value {
+    json!({
+        "blocks": [{
+            "type": "text",
+            "text": text,
+        }],
+    })
+}
+
+fn image_prompt_message_content(mode: &str, prompt: &str, model: &str, n: usize) -> Value {
+    json!({
+        "blocks": [{
+            "type": "text",
+            "text": prompt,
+        }],
+        "kind": if mode == "edit" { "image_edit" } else { "image_generation" },
+        "model": model,
+        "n": n,
+    })
+}
+
+fn image_task_request_json(
+    mode: &str,
+    prompt: &str,
+    model: &str,
+    n: usize,
+    edit_input: Option<&ImageEditInput>,
+) -> Value {
+    let mut payload = json!({
+        "mode": mode,
+        "prompt": prompt,
+        "model": model,
+        "n": n,
+    });
+    if let Some(edit_input) = edit_input {
+        payload["image"] = json!({
+            "data_b64": BASE64.encode(&edit_input.image_data),
+            "file_name": edit_input.file_name,
+            "mime_type": edit_input.mime_type,
+        });
+    }
+    payload
+}
+
+fn edit_input_for_task(task: &ImageTaskRecord) -> Result<ImageEditInput> {
+    let payload: Value = serde_json::from_str(&task.request_json)?;
+    let image = payload
+        .get("image")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("image edit task is missing image payload"))?;
+    let data_b64 = image
+        .get("data_b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("image edit task is missing image data"))?;
+    let image_data = BASE64.decode(data_b64.as_bytes()).context("invalid edit image base64")?;
+    let file_name =
+        image.get("file_name").and_then(Value::as_str).unwrap_or("image.png").to_string();
+    let mime_type =
+        image.get("mime_type").and_then(Value::as_str).unwrap_or("image/png").to_string();
+    Ok(ImageEditInput { image_data, file_name, mime_type })
+}
+
 fn should_refresh_access_token(account: &AccountRecord) -> bool {
     let has_session_token = account
         .browser_profile()
@@ -1798,7 +2039,7 @@ mod tests {
         models::{AccountProxyMode, AccountRecord, BrowserProfile, ProxyConfigRecord},
         storage::Storage,
     };
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
     use tempfile::TempDir;
     use wiremock::{

@@ -16,7 +16,7 @@ use crate::{
         AccountProxyMode, AccountRecord, AdminQueueSnapshot, ApiKeyRecord, ApiKeyRole,
         CreatedSignedLink, ImageArtifactRecord, ImageTaskRecord, ImageTaskStatus, MessageRecord,
         MessageStatus, ProxyConfigRecord, QueueSnapshot, RuntimeConfigRecord, SessionRecord,
-        SessionSource, SignedLinkRecord, UsageEventRecord,
+        SessionSource, SignedLinkRecord, TaskEventRecord, UsageEventRecord,
     },
     storage::outbox::OutboxRow,
 };
@@ -24,6 +24,8 @@ use crate::{
 const API_KEY_COLUMNS: &str = "id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms, role, notification_email, notification_enabled";
 const IMAGE_TASK_COLUMNS: &str = "id, session_id, message_id, key_id, status, mode, prompt, model, n, request_json, phase, queue_entered_at, started_at, finished_at, position_snapshot, estimated_start_after_ms, error_code, error_message";
 const IMAGE_ARTIFACT_COLUMNS: &str = "id, task_id, session_id, message_id, key_id, relative_path, mime_type, sha256, size_bytes, width, height, revised_prompt, created_at";
+const TASK_EVENT_COLUMNS: &str =
+    "rowid, id, task_id, session_id, key_id, event_kind, payload_json, created_at";
 
 /// SQLite wrapper for control-plane reads and writes.
 #[derive(Debug, Clone)]
@@ -251,6 +253,19 @@ fn image_artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageArt
         height: row.get(10)?,
         revised_prompt: row.get(11)?,
         created_at: row.get(12)?,
+    })
+}
+
+fn task_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEventRecord> {
+    Ok(TaskEventRecord {
+        sequence: row.get(0)?,
+        id: row.get(1)?,
+        task_id: row.get(2)?,
+        session_id: row.get(3)?,
+        key_id: row.get(4)?,
+        event_kind: row.get(5)?,
+        payload_json: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -1600,6 +1615,45 @@ impl ControlDb {
                 queued,
                 global_image_concurrency: config.global_image_concurrency,
             })
+        })
+        .await?
+    }
+
+    /// Returns the current maximum task-event sequence for a session.
+    pub async fn max_task_event_sequence_for_session(&self, session_id: &str) -> Result<i64> {
+        let path = self.path.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = Connection::open(path)?;
+            Ok(conn.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM task_events WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await?
+    }
+
+    /// Lists task events after a session-local sequence cursor.
+    pub async fn list_task_events_for_session_after(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: u64,
+    ) -> Result<Vec<TaskEventRecord>> {
+        let path = self.path.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<TaskEventRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT {TASK_EVENT_COLUMNS} FROM task_events WHERE session_id = ?1 AND rowid > ?2 ORDER BY rowid ASC LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![session_id, after_sequence, i64::try_from(limit).unwrap_or(i64::MAX)],
+                task_event_from_row,
+            )?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
         .await?
     }

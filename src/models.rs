@@ -435,6 +435,19 @@ pub struct QueueSnapshot {
     pub estimated_start_after_ms: Option<i64>,
 }
 
+/// Result returned after queuing one image message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageSubmissionResult {
+    /// Persisted user prompt message.
+    pub user_message: MessageRecord,
+    /// Pending assistant message that will receive artifacts.
+    pub assistant_message: MessageRecord,
+    /// Queued image task.
+    pub task: ImageTaskRecord,
+    /// Current queue position snapshot.
+    pub queue: QueueSnapshot,
+}
+
 /// Admin-visible queue snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminQueueSnapshot {
@@ -473,6 +486,27 @@ pub struct ImageArtifactRecord {
     pub height: Option<i64>,
     /// Upstream revised prompt.
     pub revised_prompt: Option<String>,
+    /// Creation epoch seconds.
+    pub created_at: i64,
+}
+
+/// Persisted task event row used by session progress streams.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEventRecord {
+    /// Monotonic SQLite row sequence for polling.
+    pub sequence: i64,
+    /// Stable event id.
+    pub id: String,
+    /// Parent task id.
+    pub task_id: String,
+    /// Parent session id.
+    pub session_id: String,
+    /// Owning API-key id.
+    pub key_id: String,
+    /// Stable event kind.
+    pub event_kind: String,
+    /// Structured event payload JSON string.
+    pub payload_json: String,
     /// Creation epoch seconds.
     pub created_at: i64,
 }

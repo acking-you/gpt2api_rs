@@ -139,3 +139,48 @@ async fn normal_key_cannot_use_admin_product_api() {
         json_request(app, "GET", "/admin/sessions?limit=20", "sk-user-a", json!({})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn image_message_creates_pending_assistant_message_and_queued_task() {
+    let (_temp, app, _storage) = build_app().await;
+    let (_status, created) =
+        json_request(app.clone(), "POST", "/sessions", "sk-user-a", json!({"title":"Image"})).await;
+    let session_id = created["session"]["id"].as_str().expect("session id");
+
+    let (status, value) = json_request(
+        app,
+        "POST",
+        &format!("/sessions/{session_id}/messages"),
+        "sk-user-a",
+        json!({"kind":"image_generation","prompt":"draw a lake","model":"gpt-image-1","n":1}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["task"]["status"], "queued");
+    assert_eq!(value["assistant_message"]["status"], "pending");
+    assert_eq!(value["queue"]["position_ahead"], 0);
+}
+
+#[tokio::test]
+async fn queued_task_can_be_cancelled_by_owner() {
+    let (_temp, app, _storage) = build_app().await;
+    let (_status, created) =
+        json_request(app.clone(), "POST", "/sessions", "sk-user-a", json!({"title":"Image"})).await;
+    let session_id = created["session"]["id"].as_str().expect("session id");
+    let (_status, submitted) = json_request(
+        app.clone(),
+        "POST",
+        &format!("/sessions/{session_id}/messages"),
+        "sk-user-a",
+        json!({"kind":"image_generation","prompt":"draw a lake","model":"gpt-image-1","n":1}),
+    )
+    .await;
+    let task_id = submitted["task"]["id"].as_str().expect("task id");
+
+    let (status, value) =
+        json_request(app, "POST", &format!("/tasks/{task_id}/cancel"), "sk-user-a", json!({}))
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["cancelled"], true);
+}

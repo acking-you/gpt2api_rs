@@ -1,10 +1,14 @@
 //! Product workspace APIs authenticated by downstream API keys.
 
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
 use serde::Deserialize;
@@ -13,7 +17,7 @@ use serde_json::{json, Value};
 use crate::{
     error::AppError,
     models::{ApiKeyRecord, ApiKeyRole, SessionDetail},
-    service::{AppService, PublicAuthError, PublicAuthFailure},
+    service::{AppService, ImageEditInput, PublicAuthError, PublicAuthFailure},
 };
 
 /// Query parameters for session listings.
@@ -61,6 +65,26 @@ pub struct PatchSessionRequest {
     /// Optional status replacement.
     #[serde(default)]
     status: Option<String>,
+}
+
+/// Body for appending one message to a session.
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateMessageRequest {
+    /// Message kind: text or image_generation.
+    #[serde(default)]
+    kind: String,
+    /// Text content for text messages.
+    #[serde(default)]
+    text: Option<String>,
+    /// Image prompt for generation messages.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Requested model.
+    #[serde(default)]
+    model: Option<String>,
+    /// Requested image count.
+    #[serde(default)]
+    n: Option<usize>,
 }
 
 /// Verifies a product API key.
@@ -171,6 +195,198 @@ pub async fn patch_session(
     Ok(Json(detail))
 }
 
+/// Appends one product message to a key-scoped session.
+pub async fn create_message(
+    Path(session_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateMessageRequest>,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    match body.kind.as_str() {
+        "text" => {
+            let text = body.text.as_deref().unwrap_or_default();
+            let model = body.model.as_deref().unwrap_or("gpt-5");
+            let detail = service
+                .submit_text_message(&key, &session_id, text, model)
+                .await
+                .map_err(map_product_request_error)?
+                .ok_or_else(|| AppError::not_found("session not found"))?;
+            Ok(Json(json!(detail)))
+        }
+        "image_generation" => {
+            let prompt = body.prompt.as_deref().unwrap_or_default();
+            let model = body.model.as_deref().unwrap_or("gpt-image-1");
+            let n = validate_image_count(body.n.unwrap_or(1))?;
+            let result = service
+                .submit_image_generation_message(&key, &session_id, prompt, model, n)
+                .await
+                .map_err(map_product_request_error)?
+                .ok_or_else(|| AppError::not_found("session not found"))?;
+            Ok(Json(json!(result)))
+        }
+        _ => Err(AppError::bad_request("kind must be text or image_generation")),
+    }
+}
+
+/// Appends one multipart image-edit message to a key-scoped session.
+pub async fn create_edit_message(
+    Path(session_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let mut prompt = String::new();
+    let mut model = "gpt-image-1".to_string();
+    let mut n = 1_usize;
+    let mut image_data = None;
+    let mut file_name = "image.png".to_string();
+    let mut mime_type = "image/png".to_string();
+
+    while let Some(field) =
+        multipart.next_field().await.map_err(|error| AppError::bad_request(error.to_string()))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "prompt" => {
+                prompt =
+                    field.text().await.map_err(|error| AppError::bad_request(error.to_string()))?
+            }
+            "model" => {
+                model =
+                    field.text().await.map_err(|error| AppError::bad_request(error.to_string()))?
+            }
+            "n" => {
+                n = field
+                    .text()
+                    .await
+                    .map_err(|error| AppError::bad_request(error.to_string()))?
+                    .parse::<usize>()
+                    .map_err(|_| AppError::bad_request("n must be an integer"))?;
+            }
+            "image" => {
+                file_name = field.file_name().unwrap_or("image.png").to_string();
+                if let Some(content_type) = field.content_type() {
+                    mime_type = content_type.to_string();
+                }
+                image_data = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|error| AppError::bad_request(error.to_string()))?
+                        .to_vec(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let image_data = image_data
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("image file is required"))?;
+    let result = service
+        .submit_image_edit_message(
+            &key,
+            &session_id,
+            &prompt,
+            &model,
+            validate_image_count(n)?,
+            ImageEditInput { image_data, file_name, mime_type },
+        )
+        .await
+        .map_err(map_product_request_error)?
+        .ok_or_else(|| AppError::not_found("session not found"))?;
+    Ok(Json(json!(result)))
+}
+
+/// Streams session snapshots and task progress events.
+pub async fn session_events(
+    Path(session_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let detail = service
+        .get_session_detail_for_key(&key, &session_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("session not found"))?;
+    let cursor = service
+        .storage()
+        .control
+        .max_task_event_sequence_for_session(&session_id)
+        .await
+        .map_err(AppError::internal)?;
+    let snapshot = serde_json::to_string(&detail).map_err(AppError::internal)?;
+    let storage = service.storage();
+    let stream_session_id = session_id;
+    let stream = async_stream::stream! {
+        yield Ok::<Event, Infallible>(Event::default().event("snapshot").data(snapshot));
+        let mut cursor = cursor;
+        loop {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            match storage
+                .control
+                .list_task_events_for_session_after(&stream_session_id, cursor, 100)
+                .await
+            {
+                Ok(events) => {
+                    for event in events {
+                        cursor = cursor.max(event.sequence);
+                        match serde_json::to_string(&event) {
+                            Ok(data) => {
+                                yield Ok(Event::default().event("task_event").data(data));
+                            }
+                            Err(error) => {
+                                yield Ok(Event::default().event("error").data(error.to_string()));
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    yield Ok(Event::default().event("error").data(error.to_string()));
+                }
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// Returns one task visible to the current product key.
+pub async fn get_task(
+    Path(task_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let task = if service.is_product_admin(&key) {
+        service.storage().control.get_image_task(&task_id).await
+    } else {
+        service.storage().control.get_image_task_for_key(&task_id, &key.id).await
+    }
+    .map_err(AppError::internal)?
+    .ok_or_else(|| AppError::not_found("task not found"))?;
+    Ok(Json(json!({ "task": task })))
+}
+
+/// Cancels one queued task visible to the current product key.
+pub async fn cancel_task(
+    Path(task_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let key_scope = if service.is_product_admin(&key) { None } else { Some(key.id.as_str()) };
+    let cancelled = service
+        .storage()
+        .control
+        .cancel_queued_image_task(&task_id, key_scope)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({ "cancelled": cancelled })))
+}
+
 /// Lists sessions across keys for product-admin API keys.
 pub async fn list_admin_sessions(
     Query(query): Query<SessionListQuery>,
@@ -232,6 +448,15 @@ fn map_product_auth_error(error: PublicAuthError) -> AppError {
     }
 }
 
+fn map_product_request_error(error: anyhow::Error) -> AppError {
+    match error.to_string().as_str() {
+        "disabled" => map_product_auth_error(PublicAuthError::Disabled),
+        "quota_exhausted" => map_product_auth_error(PublicAuthError::QuotaExhausted),
+        message if message.ends_with(" is required") => AppError::bad_request(message),
+        _ => AppError::upstream(error),
+    }
+}
+
 fn serialize_product_key(key: &ApiKeyRecord) -> Value {
     json!({
         "id": key.id,
@@ -258,5 +483,13 @@ fn normalize_optional_email(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+fn validate_image_count(n: usize) -> Result<usize, AppError> {
+    if (1..=4).contains(&n) {
+        Ok(n)
+    } else {
+        Err(AppError::bad_request("n must be between 1 and 4"))
     }
 }

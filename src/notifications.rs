@@ -72,8 +72,13 @@ pub async fn send_rendered_email(
         .subject(&rendered.subject)
         .body(rendered.text_body.clone())
         .context("build notification email")?;
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(host)
-        .context("build SMTP relay")?
+    let builder = if config.port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host).context("build SMTP relay")?
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+            .context("build SMTP STARTTLS relay")?
+    };
+    let mailer = builder
         .port(config.port)
         .credentials(Credentials::new(username.to_string(), password.to_string()))
         .build();

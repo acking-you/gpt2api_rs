@@ -22,6 +22,20 @@ cargo run -- serve \
   --admin-token secret
 ```
 
+Optional image completion emails use the same SMTP account file shape as
+StaticFlow:
+
+```text
+backend/.local/email_accounts.json
+```
+
+or an explicit path through `GPT2API_EMAIL_ACCOUNTS_FILE` / `EMAIL_ACCOUNTS_FILE`.
+The service reads `public_mailbox.smtp_host`, `public_mailbox.smtp_port`,
+`public_mailbox.username`, `public_mailbox.app_password`, and
+`public_mailbox.display_name`. Set `GPT2API_PUBLIC_BASE_URL` or `SITE_BASE_URL`
+so generated email links point at the public `/gpt2api/share/<token>` page.
+`GPT2API_SMTP_*` variables still override the file values when present.
+
 List imported accounts through the admin CLI:
 
 ```bash

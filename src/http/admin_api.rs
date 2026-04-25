@@ -217,6 +217,7 @@ pub async fn status(
         "accounts_limited": accounts_limited,
         "accounts_invalid": accounts_invalid,
         "outbox_backlog": outbox_backlog.len(),
+        "email_notifications_configured": service.email_notifications_configured(),
     })))
 }
 

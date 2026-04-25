@@ -293,6 +293,12 @@ impl AppService {
         !bearer.trim().is_empty() && bearer.trim() == self.admin_token
     }
 
+    /// Returns whether image-completion email delivery has complete SMTP config.
+    #[must_use]
+    pub fn email_notifications_configured(&self) -> bool {
+        self.smtp_config.is_complete()
+    }
+
     /// Authenticates one downstream public API key from a bearer token.
     pub async fn authenticate_public_key(
         &self,

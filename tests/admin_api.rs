@@ -126,6 +126,70 @@ async fn admin_usage_returns_empty_list_without_runtime_state() {
     assert_eq!(json, Value::Array(vec![]));
 }
 
+#[tokio::test]
+async fn admin_account_group_lifecycle_supports_create_patch_and_delete() {
+    let (_temp, app) = build_test_app("secret").await;
+
+    let create = send_json(
+        app.clone(),
+        Method::POST,
+        "/admin/account-groups",
+        "secret",
+        json!({
+            "name": "group-one",
+            "account_names": []
+        }),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let create_body = to_bytes(create.into_body(), usize::MAX).await.expect("body bytes");
+    let created: Value = serde_json::from_slice(&create_body).expect("json body");
+    let group_id = created.get("id").and_then(Value::as_str).expect("id").to_string();
+    assert_eq!(created.get("name").and_then(Value::as_str), Some("group-one"));
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/account-groups")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = to_bytes(list.into_body(), usize::MAX).await.expect("body bytes");
+    let listed: Value = serde_json::from_slice(&list_body).expect("json body");
+    assert_eq!(listed["groups"].as_array().expect("groups").len(), 1);
+
+    let patch = send_json(
+        app.clone(),
+        Method::PATCH,
+        &format!("/admin/account-groups/{group_id}"),
+        "secret",
+        json!({ "name": "group-renamed", "account_names": [] }),
+    )
+    .await;
+    assert_eq!(patch.status(), StatusCode::OK);
+    let patch_body = to_bytes(patch.into_body(), usize::MAX).await.expect("body bytes");
+    let patched: Value = serde_json::from_slice(&patch_body).expect("json body");
+    assert_eq!(patched.get("name").and_then(Value::as_str), Some("group-renamed"));
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/admin/account-groups/{group_id}"))
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(delete.status(), StatusCode::OK);
+}
+
 async fn send_json(
     app: axum::Router,
     method: Method,
@@ -158,7 +222,7 @@ async fn admin_key_lifecycle_supports_create_patch_rotate_and_delete() {
         json!({
             "name": "demo",
             "quota_total_calls": 7,
-            "route_strategy": "fixed",
+            "route_strategy": "auto",
             "request_max_concurrency": 2,
             "request_min_start_interval_ms": 50
         }),

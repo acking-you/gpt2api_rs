@@ -41,6 +41,7 @@ async fn bootstrap_adds_product_tables_and_defaults() {
     assert_eq!(config.global_image_concurrency, 1);
     assert_eq!(config.signed_link_ttl_seconds, 604_800);
     assert_eq!(config.queue_eta_window_size, 20);
+    assert_eq!(config.image_task_timeout_seconds, 900);
 }
 
 #[tokio::test]

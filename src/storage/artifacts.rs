@@ -1,11 +1,12 @@
 //! Filesystem-backed generated image artifact storage.
 
 use std::{
-    path::PathBuf,
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -82,6 +83,96 @@ impl ArtifactStore {
         ensure!(canonical_path.starts_with(canonical_root), "artifact path escaped root");
         Ok(tokio::fs::read(canonical_path).await?)
     }
+
+    /// Deletes artifact files and then prunes empty artifact directories.
+    pub async fn delete_artifacts(&self, artifacts: &[ImageArtifactRecord]) -> Result<()> {
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let images_dir = self.images_dir.clone();
+        let artifacts = artifacts.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let canonical_root = root.canonicalize().context("canonical artifact root")?;
+            let canonical_images_dir =
+                images_dir.canonicalize().context("canonical image artifact directory")?;
+            ensure!(
+                canonical_images_dir.starts_with(&canonical_root),
+                "image artifact directory escaped root"
+            );
+            for artifact in &artifacts {
+                let relative_path = safe_relative_artifact_path(&artifact.relative_path)?;
+                let full_path = root.join(relative_path);
+                delete_artifact_file(&canonical_root, &canonical_images_dir, &full_path)
+                    .with_context(|| format!("delete artifact {}", artifact.relative_path))?;
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+}
+
+fn safe_relative_artifact_path(value: &str) -> Result<PathBuf> {
+    let path = Path::new(value);
+    ensure!(!path.is_absolute(), "artifact path must be relative");
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("artifact path escaped root")
+            }
+        }
+    }
+    ensure!(!normalized.as_os_str().is_empty(), "artifact path is empty");
+    Ok(normalized)
+}
+
+fn delete_artifact_file(root: &Path, images_dir: &Path, full_path: &Path) -> Result<()> {
+    let parent = full_path.parent().context("artifact path has no parent")?;
+    let canonical_parent = match parent.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("canonical artifact parent"),
+    };
+    ensure!(canonical_parent.starts_with(root), "artifact parent escaped root");
+    ensure!(canonical_parent.starts_with(images_dir), "artifact parent escaped image directory");
+    match std::fs::remove_file(full_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove artifact file"),
+    }
+    prune_empty_dirs(parent, images_dir)
+}
+
+fn prune_empty_dirs(start: &Path, stop: &Path) -> Result<()> {
+    let mut current = start.to_path_buf();
+    loop {
+        let canonical = match current.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => return Err(error).context("canonical artifact cleanup directory"),
+        };
+        if canonical == stop || !canonical.starts_with(stop) {
+            break;
+        }
+        match std::fs::remove_dir(&current) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error).context("remove empty artifact directory"),
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 fn detect_mime_type(image_data: &[u8]) -> &'static str {

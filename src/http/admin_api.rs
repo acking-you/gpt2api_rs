@@ -1,6 +1,9 @@
 //! Admin management endpoints.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,10 +17,11 @@ use crate::{
     error::AppError,
     models::{ApiKeyRecord, ApiKeyRole, BrowserProfile, ProxyConfigRecord, UsageEventRecord},
     service::{
-        AccountImportItem, AccountUpdate, AdminAccountView, ApiKeyCreate, ApiKeySecretRecord,
-        ApiKeyUpdate, AppService, ProxyConfigCreate, ProxyConfigUpdate, PublicAuthError,
-        PublicAuthFailure,
+        AccountGroupCreate, AccountGroupUpdate, AccountImportItem, AccountUpdate, AdminAccountView,
+        ApiKeyCreate, ApiKeyUpdate, AppService, ProxyConfigCreate, ProxyConfigUpdate,
+        PublicAuthError, PublicAuthFailure,
     },
+    storage::events::UsageEventQuery,
 };
 
 enum KeyAdminAuth {
@@ -30,6 +34,22 @@ enum KeyAdminAuth {
 pub struct UsageQuery {
     /// Optional maximum number of rows to return.
     pub limit: Option<u64>,
+}
+
+/// Query parameters supported by the paginated usage-event ledger endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UsageEventsQuery {
+    /// Optional exact API key id.
+    pub key_id: Option<String>,
+    /// Optional search term.
+    pub q: Option<String>,
+    /// Include management-plane `/admin/*` calls in the result set.
+    #[serde(default)]
+    pub include_admin: bool,
+    /// Optional maximum number of rows to return.
+    pub limit: Option<u64>,
+    /// Optional page offset.
+    pub offset: Option<u64>,
 }
 
 /// Request body for importing access tokens or session JSON blobs.
@@ -131,6 +151,27 @@ pub struct UpdateProxyConfigRequest {
     status: Option<String>,
 }
 
+/// Request body for creating one reusable account group.
+#[derive(Debug, Deserialize)]
+pub struct CreateAccountGroupRequest {
+    /// Human-readable account-group label.
+    name: String,
+    /// Upstream account names that belong to this group.
+    #[serde(default)]
+    account_names: Vec<String>,
+}
+
+/// Request body for updating one reusable account group.
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateAccountGroupRequest {
+    /// Optional replacement label.
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional replacement member account names.
+    #[serde(default)]
+    account_names: Option<Vec<String>>,
+}
+
 /// Request body for creating one downstream API key.
 #[derive(Debug, Deserialize)]
 pub struct CreateKeyRequest {
@@ -147,6 +188,9 @@ pub struct CreateKeyRequest {
     /// Optional bound account-group id.
     #[serde(default)]
     account_group_id: Option<String>,
+    /// Optional directly bound upstream account name.
+    #[serde(default)]
+    fixed_account_name: Option<String>,
     /// Optional per-key concurrency cap.
     #[serde(default)]
     request_max_concurrency: Option<u64>,
@@ -182,6 +226,9 @@ pub struct UpdateKeyRequest {
     /// Optional replacement account-group id. `null` clears the field.
     #[serde(default)]
     account_group_id: Option<Option<String>>,
+    /// Optional replacement fixed account name. `null` clears the field.
+    #[serde(default)]
+    fixed_account_name: Option<Option<String>>,
     /// Optional replacement concurrency cap. `null` clears the field.
     #[serde(default)]
     request_max_concurrency: Option<Option<u64>>,
@@ -371,7 +418,7 @@ pub async fn create_proxy_config(
             status: body.status,
         })
         .await
-        .map_err(AppError::internal)?;
+        .map_err(map_account_group_error)?;
     Ok(Json(record))
 }
 
@@ -395,7 +442,7 @@ pub async fn update_proxy_config(
             },
         )
         .await
-        .map_err(AppError::internal)?
+        .map_err(map_account_group_error)?
     else {
         return Err(AppError::not_found("proxy config not found"));
     };
@@ -435,13 +482,72 @@ pub async fn check_proxy_config(
     })))
 }
 
+/// Lists reusable account groups.
+pub async fn list_account_groups(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_key_admin(&headers, &service).await?;
+    let groups = service.list_account_groups().await.map_err(AppError::internal)?;
+    Ok(Json(json!({ "groups": groups })))
+}
+
+/// Creates one reusable account group.
+pub async fn create_account_group(
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateAccountGroupRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_key_admin(&headers, &service).await?;
+    let group = service
+        .create_account_group(&AccountGroupCreate {
+            name: body.name,
+            account_names: body.account_names,
+        })
+        .await
+        .map_err(map_account_group_error)?;
+    Ok(Json(json!(group)))
+}
+
+/// Updates one reusable account group.
+pub async fn update_account_group(
+    Path(group_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateAccountGroupRequest>,
+) -> Result<Json<Value>, AppError> {
+    require_key_admin(&headers, &service).await?;
+    let Some(group) = service
+        .update_account_group(
+            &group_id,
+            &AccountGroupUpdate { name: body.name, account_names: body.account_names },
+        )
+        .await
+        .map_err(map_account_group_error)?
+    else {
+        return Err(AppError::not_found("account group not found"));
+    };
+    Ok(Json(json!(group)))
+}
+
+/// Deletes one reusable account group.
+pub async fn delete_account_group(
+    Path(group_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_key_admin(&headers, &service).await?;
+    let deleted = service.delete_account_group(&group_id).await.map_err(map_account_group_error)?;
+    Ok(Json(json!({ "deleted": deleted, "id": group_id })))
+}
+
 /// Lists configured downstream API keys.
 pub async fn list_keys(
     State(service): State<Arc<AppService>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_key_admin(&headers, &service).await?;
-    let keys = service.storage().control.list_api_keys().await.map_err(AppError::internal)?;
+    let keys = service.list_api_keys_with_ledger_usage().await.map_err(AppError::internal)?;
     let include_secret = matches!(auth, KeyAdminAuth::ServiceAdmin);
     Ok(Json(Value::Array(
         keys.iter()
@@ -469,6 +575,7 @@ pub async fn create_key(
             status: body.status,
             route_strategy: body.route_strategy,
             account_group_id: body.account_group_id,
+            fixed_account_name: body.fixed_account_name,
             request_max_concurrency: body.request_max_concurrency,
             request_min_start_interval_ms: body.request_min_start_interval_ms,
             role: body.role,
@@ -477,7 +584,8 @@ pub async fn create_key(
         })
         .await
         .map_err(AppError::internal)?;
-    Ok(Json(serialize_key_record(&created, true)))
+    let key = service.key_with_ledger_usage(&created.key).await.map_err(AppError::internal)?;
+    Ok(Json(serialize_key(&key, Some(created.secret_plaintext.as_str()))))
 }
 
 /// Updates one downstream API key.
@@ -497,6 +605,7 @@ pub async fn update_key(
                 quota_total_calls: body.quota_total_calls,
                 route_strategy: body.route_strategy,
                 account_group_id: body.account_group_id,
+                fixed_account_name: body.fixed_account_name,
                 request_max_concurrency: body.request_max_concurrency,
                 request_min_start_interval_ms: body.request_min_start_interval_ms,
                 role: body.role,
@@ -510,10 +619,11 @@ pub async fn update_key(
         return Err(AppError::not_found("key not found"));
     };
     let secret = match auth {
-        KeyAdminAuth::ServiceAdmin => key.secret_plaintext.as_deref(),
+        KeyAdminAuth::ServiceAdmin => key.secret_plaintext.clone(),
         KeyAdminAuth::ProductAdmin => None,
     };
-    Ok(Json(serialize_key(&key, secret)))
+    let key = service.key_with_ledger_usage(&key).await.map_err(AppError::internal)?;
+    Ok(Json(serialize_key(&key, secret.as_deref())))
 }
 
 /// Rotates one downstream API key and returns the stored plaintext secret.
@@ -526,7 +636,8 @@ pub async fn rotate_key(
     let Some(rotated) = service.rotate_api_key(&key_id).await.map_err(AppError::internal)? else {
         return Err(AppError::not_found("key not found"));
     };
-    Ok(Json(serialize_key_record(&rotated, true)))
+    let key = service.key_with_ledger_usage(&rotated.key).await.map_err(AppError::internal)?;
+    Ok(Json(serialize_key(&key, Some(rotated.secret_plaintext.as_str()))))
 }
 
 /// Deletes one downstream API key.
@@ -558,6 +669,43 @@ pub async fn list_usage(
     Ok(Json(usage))
 }
 
+/// Lists usage-event ledger rows with paging, filtering, and aggregate credit total.
+pub async fn list_usage_events(
+    Query(query): Query<UsageEventsQuery>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    require_admin(&headers, &service)?;
+    let key_id = query.key_id;
+    let q = query.q;
+    let activity_key_id =
+        key_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let page = service
+        .storage()
+        .events
+        .query_usage_events(UsageEventQuery {
+            key_id,
+            q,
+            include_admin: query.include_admin,
+            limit: query.limit.unwrap_or(50),
+            offset: query.offset.unwrap_or(0),
+        })
+        .await
+        .map_err(AppError::internal)?;
+    let activity = service.request_activity_snapshot(activity_key_id.as_deref());
+    Ok(Json(json!({
+        "total": page.total,
+        "offset": page.offset,
+        "limit": page.limit,
+        "has_more": page.has_more,
+        "current_rpm": activity.rpm,
+        "current_in_flight": activity.in_flight,
+        "billable_credit_total": page.billable_credit_total,
+        "events": page.events,
+        "generated_at": unix_timestamp_secs(),
+    })))
+}
+
 fn require_admin(headers: &HeaderMap, service: &Arc<AppService>) -> Result<(), AppError> {
     let token = extract_bearer_token(headers);
     if service.is_admin_token(&token) {
@@ -565,6 +713,13 @@ fn require_admin(headers: &HeaderMap, service: &Arc<AppService>) -> Result<(), A
     } else {
         Err(AppError::with_status(StatusCode::UNAUTHORIZED, "authorization is invalid"))
     }
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 async fn require_key_admin(
@@ -600,6 +755,20 @@ fn map_product_auth_failure(error: PublicAuthFailure) -> AppError {
     }
 }
 
+fn map_account_group_error(error: anyhow::Error) -> AppError {
+    let message = error.to_string();
+    if message.contains("still bound") {
+        AppError::conflict(message)
+    } else if message.contains("unknown account")
+        || message.contains("account group")
+        || message.contains("required")
+    {
+        AppError::bad_request(message)
+    } else {
+        AppError::internal(error)
+    }
+}
+
 fn map_product_auth_error(error: PublicAuthError) -> AppError {
     match error {
         PublicAuthError::InvalidKey => {
@@ -615,10 +784,6 @@ fn default_route_strategy() -> String {
     "auto".to_string()
 }
 
-fn serialize_key_record(record: &ApiKeySecretRecord, include_secret: bool) -> Value {
-    serialize_key(&record.key, include_secret.then_some(record.secret_plaintext.as_str()))
-}
-
 fn serialize_key(key: &ApiKeyRecord, secret_plaintext: Option<&str>) -> Value {
     json!({
         "id": key.id,
@@ -629,6 +794,7 @@ fn serialize_key(key: &ApiKeyRecord, secret_plaintext: Option<&str>) -> Value {
         "quota_used_calls": key.quota_used_calls,
         "route_strategy": key.route_strategy,
         "account_group_id": key.account_group_id,
+        "fixed_account_name": key.fixed_account_name,
         "request_max_concurrency": key.request_max_concurrency,
         "request_min_start_interval_ms": key.request_min_start_interval_ms,
         "role": key.role.as_str(),

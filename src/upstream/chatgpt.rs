@@ -1,6 +1,7 @@
 //! ChatGPT Web transport helpers for image generation and account refresh.
 
 use std::{
+    fmt,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -82,6 +83,23 @@ pub struct ChatgptImageResult {
     /// Upstream model actually sent to ChatGPT Web.
     pub resolved_model: String,
 }
+
+/// Upstream returned an assistant text response instead of image artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatgptImageTextResponse {
+    /// Final assistant text.
+    pub text: String,
+    /// Upstream model actually sent to ChatGPT Web.
+    pub resolved_model: String,
+}
+
+impl fmt::Display for ChatgptImageTextResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for ChatgptImageTextResponse {}
 
 /// Successful upstream text completion result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,7 +593,11 @@ impl ChatgptUpstreamClient {
         }
         if file_ids.is_empty() {
             if !parsed.text.trim().is_empty() {
-                bail!("{}", parsed.text.trim());
+                return Err(ChatgptImageTextResponse {
+                    text: parsed.text.trim().to_string(),
+                    resolved_model,
+                }
+                .into());
             }
             bail!("no image returned from upstream");
         }
@@ -1366,19 +1388,8 @@ fn parse_sse_payload(raw: &str) -> ParsedConversationSse {
                     .to_string();
             }
         }
-        if let Some(message) = value.get("message").and_then(Value::as_object) {
-            if let Some(content) = message.get("content").and_then(Value::as_object) {
-                if content.get("content_type").and_then(Value::as_str) == Some("text") {
-                    if let Some(text) = content
-                        .get("parts")
-                        .and_then(Value::as_array)
-                        .and_then(|parts| parts.first())
-                        .and_then(Value::as_str)
-                    {
-                        parsed.text.push_str(text);
-                    }
-                }
-            }
+        if let Some(text) = extract_assistant_text_snapshot(&value) {
+            parsed.text = text;
         }
     }
     parsed

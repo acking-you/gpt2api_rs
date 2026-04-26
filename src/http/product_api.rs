@@ -22,7 +22,11 @@ use serde_json::{json, Value};
 use crate::{
     error::AppError,
     models::{ApiKeyRecord, ApiKeyRole, SessionDetail},
-    service::{AppService, ImageEditInput, PublicAuthError, PublicAuthFailure},
+    service::{
+        AppService, ImageEditInput, ImageEditSubmission, ImageGenerationSubmission,
+        PublicAuthError, PublicAuthFailure, RequestLogContext,
+    },
+    storage::events::UsageEventQuery,
 };
 
 /// Query parameters for session listings.
@@ -61,6 +65,20 @@ pub struct NotificationRequest {
     notification_enabled: Option<bool>,
 }
 
+/// Query parameters for current-key usage event listings.
+#[derive(Debug, Default, Deserialize)]
+pub struct MyUsageEventsQuery {
+    /// Optional search term.
+    #[serde(default)]
+    q: Option<String>,
+    /// Optional maximum number of rows.
+    #[serde(default)]
+    limit: Option<u64>,
+    /// Optional page offset.
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
 /// Body for patching one session.
 #[derive(Debug, Default, Deserialize)]
 pub struct PatchSessionRequest {
@@ -90,6 +108,9 @@ pub struct CreateMessageRequest {
     /// Requested image count.
     #[serde(default)]
     n: Option<usize>,
+    /// Requested output size.
+    #[serde(default)]
+    size: Option<String>,
 }
 
 /// Body for product-admin queue configuration updates.
@@ -98,6 +119,9 @@ pub struct AdminQueueConfigRequest {
     /// Replacement global image concurrency.
     #[serde(default)]
     global_image_concurrency: Option<i64>,
+    /// Replacement per-task timeout.
+    #[serde(default)]
+    image_task_timeout_seconds: Option<i64>,
 }
 
 /// Verifies a product API key.
@@ -106,6 +130,7 @@ pub async fn verify_auth(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let key = authenticate_product_key(&service, &headers).await?;
+    let key = service.key_with_ledger_usage(&key).await.map_err(AppError::internal)?;
     Ok(Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -119,7 +144,39 @@ pub async fn get_me(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let key = authenticate_product_key(&service, &headers).await?;
+    let key = service.key_with_ledger_usage(&key).await.map_err(AppError::internal)?;
     Ok(Json(json!({ "key": serialize_product_key(&key) })))
+}
+
+/// Lists usage events for the current key only.
+pub async fn get_my_usage_events(
+    Query(query): Query<MyUsageEventsQuery>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let hydrated = service.key_with_ledger_usage(&key).await.map_err(AppError::internal)?;
+    let page = service
+        .storage()
+        .events
+        .query_usage_events(UsageEventQuery {
+            key_id: Some(key.id.clone()),
+            q: query.q,
+            include_admin: false,
+            limit: query.limit.unwrap_or(50),
+            offset: query.offset.unwrap_or(0),
+        })
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "key": serialize_product_key(&hydrated),
+        "total": page.total,
+        "offset": page.offset,
+        "limit": page.limit,
+        "has_more": page.has_more,
+        "billable_credit_total": page.billable_credit_total,
+        "events": page.events,
+    })))
 }
 
 /// Updates current key notification settings.
@@ -136,6 +193,7 @@ pub async fn update_my_notification(
         key.notification_enabled = enabled;
     }
     service.storage().control.upsert_api_key(&key).await.map_err(AppError::internal)?;
+    let key = service.key_with_ledger_usage(&key).await.map_err(AppError::internal)?;
     Ok(Json(json!({ "key": serialize_product_key(&key) })))
 }
 
@@ -208,6 +266,21 @@ pub async fn patch_session(
     Ok(Json(detail))
 }
 
+/// Permanently deletes one key-scoped session and its conversation records.
+pub async fn delete_session(
+    Path(session_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let deleted =
+        service.delete_session_for_key(&key, &session_id).await.map_err(AppError::internal)?;
+    if !deleted {
+        return Err(AppError::not_found("session not found"));
+    }
+    Ok(Json(json!({ "deleted": true, "id": session_id })))
+}
+
 /// Appends one product message to a key-scoped session.
 pub async fn create_message(
     Path(session_id): Path<String>,
@@ -229,10 +302,23 @@ pub async fn create_message(
         }
         "image_generation" => {
             let prompt = body.prompt.as_deref().unwrap_or_default();
-            let model = body.model.as_deref().unwrap_or("gpt-image-1");
+            let model = body.model.as_deref().unwrap_or("gpt-image-2");
             let n = validate_image_count(body.n.unwrap_or(1))?;
+            let size = body.size.as_deref().unwrap_or("1024x1024");
+            let request_context = request_context_from_headers(
+                &headers,
+                "POST",
+                &format!("/sessions/{session_id}/messages"),
+            );
             let result = service
-                .submit_image_generation_message(&key, &session_id, prompt, model, n)
+                .submit_image_generation_message_with_context(
+                    &key,
+                    &session_id,
+                    prompt,
+                    model,
+                    n,
+                    ImageGenerationSubmission { size: size.to_string(), request_context },
+                )
                 .await
                 .map_err(map_product_request_error)?
                 .ok_or_else(|| AppError::not_found("session not found"))?;
@@ -253,6 +339,7 @@ pub async fn create_edit_message(
     let mut prompt = String::new();
     let mut model = "gpt-image-1".to_string();
     let mut n = 1_usize;
+    let mut size = "1024x1024".to_string();
     let mut image_data = None;
     let mut file_name = "image.png".to_string();
     let mut mime_type = "image/png".to_string();
@@ -278,6 +365,10 @@ pub async fn create_edit_message(
                     .parse::<usize>()
                     .map_err(|_| AppError::bad_request("n must be an integer"))?;
             }
+            "size" => {
+                size =
+                    field.text().await.map_err(|error| AppError::bad_request(error.to_string()))?
+            }
             "image" => {
                 file_name = field.file_name().unwrap_or("image.png").to_string();
                 if let Some(content_type) = field.content_type() {
@@ -299,13 +390,21 @@ pub async fn create_edit_message(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::bad_request("image file is required"))?;
     let result = service
-        .submit_image_edit_message(
+        .submit_image_edit_message_with_context(
             &key,
             &session_id,
             &prompt,
             &model,
             validate_image_count(n)?,
-            ImageEditInput { image_data, file_name, mime_type },
+            ImageEditSubmission {
+                edit_input: ImageEditInput { image_data, file_name, mime_type },
+                size,
+                request_context: request_context_from_headers(
+                    &headers,
+                    "POST",
+                    &format!("/sessions/{session_id}/messages/edit"),
+                ),
+            },
         )
         .await
         .map_err(map_product_request_error)?
@@ -551,6 +650,13 @@ pub async fn patch_admin_queue_config(
     if !(1..=16).contains(&global_image_concurrency) {
         return Err(AppError::bad_request("global_image_concurrency must be between 1 and 16"));
     }
+    let image_task_timeout_seconds =
+        body.image_task_timeout_seconds.unwrap_or(current.image_task_timeout_seconds);
+    if !(60..=7200).contains(&image_task_timeout_seconds) {
+        return Err(AppError::bad_request(
+            "image_task_timeout_seconds must be between 60 and 7200",
+        ));
+    }
     let config = service
         .storage()
         .control
@@ -558,6 +664,7 @@ pub async fn patch_admin_queue_config(
             global_image_concurrency,
             current.signed_link_ttl_seconds,
             current.queue_eta_window_size,
+            image_task_timeout_seconds,
         )
         .await
         .map_err(AppError::internal)?;
@@ -623,6 +730,66 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn request_context_from_headers(headers: &HeaderMap, method: &str, url: &str) -> RequestLogContext {
+    RequestLogContext {
+        method: method.to_string(),
+        url: url.to_string(),
+        client_ip: extract_client_ip(headers),
+        request_headers_json: Some(sanitized_headers_json(headers)),
+    }
+}
+
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    for name in ["cf-connecting-ip", "x-real-ip", "x-client-ip"] {
+        if let Some(value) = header_value(headers, name) {
+            return value;
+        }
+    }
+    header_value(headers, "x-forwarded-for")
+        .and_then(|value| value.split(',').next().map(str::trim).map(ToString::to_string))
+        .filter(|value| !value.is_empty())
+        .or_else(|| header_value(headers, "forwarded").and_then(parse_forwarded_for))
+        .unwrap_or_default()
+}
+
+fn parse_forwarded_for(value: String) -> Option<String> {
+    value.split(';').find_map(|part| {
+        let (name, raw) = part.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("for") {
+            return None;
+        }
+        Some(raw.trim_matches('"').trim().to_string()).filter(|item| !item.is_empty())
+    })
+}
+
+fn sanitized_headers_json(headers: &HeaderMap) -> String {
+    let mut value = serde_json::Map::new();
+    for name in [
+        "user-agent",
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-client-ip",
+        "cf-connecting-ip",
+        "forwarded",
+        "referer",
+        "origin",
+    ] {
+        if let Some(header) = header_value(headers, name) {
+            value.insert(name.to_string(), json!(header));
+        }
+    }
+    Value::Object(value).to_string()
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 async fn authenticate_product_key(
     service: &Arc<AppService>,
     headers: &HeaderMap,
@@ -672,6 +839,7 @@ fn serialize_product_key(key: &ApiKeyRecord) -> Value {
         "quota_used_calls": key.quota_used_calls,
         "route_strategy": key.route_strategy,
         "account_group_id": key.account_group_id,
+        "fixed_account_name": key.fixed_account_name,
         "request_max_concurrency": key.request_max_concurrency,
         "request_min_start_interval_ms": key.request_min_start_interval_ms,
         "notification_email": key.notification_email,

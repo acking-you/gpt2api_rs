@@ -13,15 +13,15 @@ use uuid::Uuid;
 use super::migrations::bootstrap_control_schema;
 use crate::{
     models::{
-        AccountProxyMode, AccountRecord, AdminQueueSnapshot, ApiKeyRecord, ApiKeyRole,
-        CreatedSignedLink, ImageArtifactRecord, ImageTaskRecord, ImageTaskStatus, MessageRecord,
-        MessageStatus, ProxyConfigRecord, QueueSnapshot, RuntimeConfigRecord, SessionRecord,
-        SessionSource, SignedLinkRecord, TaskEventRecord, UsageEventRecord,
+        AccountGroupRecord, AccountProxyMode, AccountRecord, AdminQueueSnapshot, ApiKeyRecord,
+        ApiKeyRole, CreatedSignedLink, ImageArtifactRecord, ImageTaskRecord, ImageTaskStatus,
+        MessageRecord, MessageStatus, ProxyConfigRecord, QueueSnapshot, RuntimeConfigRecord,
+        SessionRecord, SessionSource, SignedLinkRecord, TaskEventRecord, UsageEventRecord,
     },
     storage::outbox::OutboxRow,
 };
 
-const API_KEY_COLUMNS: &str = "id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms, role, notification_email, notification_enabled";
+const API_KEY_COLUMNS: &str = "id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, fixed_account_name, request_max_concurrency, request_min_start_interval_ms, role, notification_email, notification_enabled";
 const IMAGE_TASK_COLUMNS: &str = "id, session_id, message_id, key_id, status, mode, prompt, model, n, request_json, phase, queue_entered_at, started_at, finished_at, position_snapshot, estimated_start_after_ms, error_code, error_message";
 const IMAGE_ARTIFACT_COLUMNS: &str = "id, task_id, session_id, message_id, key_id, relative_path, mime_type, sha256, size_bytes, width, height, revised_prompt, created_at";
 const TASK_EVENT_COLUMNS: &str =
@@ -55,10 +55,10 @@ pub struct CreateImageTaskInput<'a> {
 }
 
 fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
-    let role_raw: String = row.get(11)?;
+    let role_raw: String = row.get(12)?;
     let role = ApiKeyRole::parse(&role_raw)
-        .ok_or_else(|| invalid_text_value(11, &role_raw, "api key role"))?;
-    let notification_enabled: i64 = row.get(13)?;
+        .ok_or_else(|| invalid_text_value(12, &role_raw, "api key role"))?;
+    let notification_enabled: i64 = row.get(14)?;
     Ok(ApiKeyRecord {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -69,10 +69,11 @@ fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
         quota_used_calls: row.get(6)?,
         route_strategy: row.get(7)?,
         account_group_id: row.get(8)?,
-        request_max_concurrency: row.get(9)?,
-        request_min_start_interval_ms: row.get(10)?,
+        fixed_account_name: row.get(9)?,
+        request_max_concurrency: row.get(10)?,
+        request_min_start_interval_ms: row.get(11)?,
         role,
-        notification_email: row.get(12)?,
+        notification_email: row.get(13)?,
         notification_enabled: notification_enabled != 0,
     })
 }
@@ -148,6 +149,7 @@ fn runtime_config_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeC
         global_image_concurrency: row.get(7)?,
         signed_link_ttl_seconds: row.get(8)?,
         queue_eta_window_size: row.get(9)?,
+        image_task_timeout_seconds: row.get(10)?,
     })
 }
 
@@ -296,6 +298,14 @@ fn optional_row<T>(result: rusqlite::Result<T>) -> Result<Option<T>> {
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn account_group_members(conn: &Connection, group_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_name FROM account_group_members WHERE group_id = ?1 ORDER BY account_name ASC",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn normalize_session_title(title: &str) -> String {
@@ -608,14 +618,110 @@ impl ControlDb {
         .await?
     }
 
+    /// Lists all reusable account groups ordered by name.
+    pub async fn list_account_groups(&self) -> Result<Vec<AccountGroupRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<AccountGroupRecord>> {
+            let conn = Connection::open(path)?;
+            let mut stmt =
+                conn.prepare("SELECT id, name FROM account_groups ORDER BY name ASC, id ASC")?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            let mut groups = Vec::new();
+            for row in rows {
+                let (id, name) = row?;
+                groups.push(AccountGroupRecord {
+                    account_names: account_group_members(&conn, &id)?,
+                    id,
+                    name,
+                });
+            }
+            Ok(groups)
+        })
+        .await?
+    }
+
+    /// Fetches one reusable account group by id.
+    pub async fn get_account_group(&self, group_id: &str) -> Result<Option<AccountGroupRecord>> {
+        let path = self.path.clone();
+        let group_id = group_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<AccountGroupRecord>> {
+            let conn = Connection::open(path)?;
+            let row = conn.query_row(
+                "SELECT id, name FROM account_groups WHERE id = ?1 LIMIT 1",
+                [&group_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            );
+            match row {
+                Ok((id, name)) => Ok(Some(AccountGroupRecord {
+                    account_names: account_group_members(&conn, &id)?,
+                    id,
+                    name,
+                })),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        })
+        .await?
+    }
+
+    /// Inserts or replaces one reusable account group and all its members.
+    pub async fn upsert_account_group(&self, group: &AccountGroupRecord) -> Result<()> {
+        let path = self.path.clone();
+        let group = group.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO account_groups (id, name) VALUES (?1, ?2)",
+                params![&group.id, &group.name],
+            )?;
+            tx.execute(
+                "DELETE FROM account_group_members WHERE group_id = ?1",
+                params![&group.id],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO account_group_members (group_id, account_name) VALUES (?1, ?2)",
+                )?;
+                for account_name in &group.account_names {
+                    stmt.execute(params![&group.id, account_name])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Deletes one reusable account group.
+    pub async fn delete_account_group(&self, group_id: &str) -> Result<bool> {
+        let path = self.path.clone();
+        let group_id = group_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM account_group_members WHERE group_id = ?1",
+                params![&group_id],
+            )?;
+            let changed =
+                tx.execute("DELETE FROM account_groups WHERE id = ?1", params![&group_id])?;
+            tx.commit()?;
+            Ok(changed > 0)
+        })
+        .await?
+    }
+
     /// Inserts or replaces a downstream API-key configuration row.
     pub async fn upsert_api_key(&self, key: &ApiKeyRecord) -> Result<()> {
         let path = self.path.clone();
         let key = key.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
 	            let conn = Connection::open(path)?;
-	            conn.execute(
-	                "INSERT OR REPLACE INTO api_keys (id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, request_max_concurrency, request_min_start_interval_ms, role, notification_email, notification_enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            conn.execute(
+	                "INSERT OR REPLACE INTO api_keys (id, name, secret_hash, secret_plaintext, status, quota_total_calls, quota_used_calls, route_strategy, account_group_id, fixed_account_name, request_max_concurrency, request_min_start_interval_ms, role, notification_email, notification_enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
 	                params![
 	                    &key.id,
 	                    &key.name,
@@ -626,6 +732,7 @@ impl ControlDb {
                     key.quota_used_calls,
                     &key.route_strategy,
 	                    &key.account_group_id,
+                    &key.fixed_account_name,
 	                    &key.request_max_concurrency,
 	                    &key.request_min_start_interval_ms,
 	                    key.role.as_str(),
@@ -734,7 +841,8 @@ impl ControlDb {
                     event_flush_interval_seconds,
                     global_image_concurrency,
                     signed_link_ttl_seconds,
-                    queue_eta_window_size
+                    queue_eta_window_size,
+                    image_task_timeout_seconds
                 FROM runtime_config
                 WHERE id = 1
                 LIMIT 1
@@ -751,6 +859,7 @@ impl ControlDb {
         global_image_concurrency: i64,
         signed_link_ttl_seconds: i64,
         queue_eta_window_size: i64,
+        image_task_timeout_seconds: i64,
     ) -> Result<RuntimeConfigRecord> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<RuntimeConfigRecord> {
@@ -761,10 +870,16 @@ impl ControlDb {
                 SET
                     global_image_concurrency = ?1,
                     signed_link_ttl_seconds = ?2,
-                    queue_eta_window_size = ?3
+                    queue_eta_window_size = ?3,
+                    image_task_timeout_seconds = ?4
                 WHERE id = 1
                 "#,
-                params![global_image_concurrency, signed_link_ttl_seconds, queue_eta_window_size,],
+                params![
+                    global_image_concurrency,
+                    signed_link_ttl_seconds,
+                    queue_eta_window_size,
+                    image_task_timeout_seconds,
+                ],
             )?;
             let mut stmt = conn.prepare(
                 r#"
@@ -778,7 +893,8 @@ impl ControlDb {
                     event_flush_interval_seconds,
                     global_image_concurrency,
                     signed_link_ttl_seconds,
-                    queue_eta_window_size
+                    queue_eta_window_size,
+                    image_task_timeout_seconds
                 FROM runtime_config
                 WHERE id = 1
                 LIMIT 1
@@ -849,11 +965,84 @@ impl ControlDb {
                 r#"
                 SELECT id, key_id, title, source, status, created_at, updated_at, last_message_at
                 FROM sessions
-                WHERE id = ?1 AND key_id = ?2
+                WHERE id = ?1 AND key_id = ?2 AND status != 'deleted'
                 LIMIT 1
                 "#,
             )?;
             optional_row(stmt.query_row(params![session_id, key_id], session_from_row))
+        })
+        .await?
+    }
+
+    /// Permanently deletes one key-scoped session and all session-owned rows.
+    pub async fn hard_delete_session_for_key(
+        &self,
+        session_id: &str,
+        key_id: &str,
+    ) -> Result<Option<Vec<ImageArtifactRecord>>> {
+        let path = self.path.clone();
+        let session_id = session_id.to_string();
+        let key_id = key_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<ImageArtifactRecord>>> {
+            let mut conn = Connection::open(path)?;
+            let tx = conn.transaction()?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE id = ?1 AND key_id = ?2 LIMIT 1",
+                    params![&session_id, &key_id],
+                    |_| Ok(()),
+                )
+                .map(|_| true)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                    other => Err(other),
+                })?;
+            if !exists {
+                return Ok(None);
+            }
+            let artifacts = {
+                let sql = format!(
+                    "SELECT {IMAGE_ARTIFACT_COLUMNS} FROM image_artifacts WHERE session_id = ?1 AND key_id = ?2 ORDER BY created_at ASC, rowid ASC"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(params![&session_id, &key_id], image_artifact_from_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            tx.execute(
+                r#"
+                DELETE FROM signed_links
+                WHERE (scope = 'session' AND scope_id = ?1)
+                   OR (
+                        scope = 'image_task'
+                        AND scope_id IN (
+                            SELECT id FROM image_tasks WHERE session_id = ?1 AND key_id = ?2
+                        )
+                   )
+                "#,
+                params![&session_id, &key_id],
+            )?;
+            tx.execute(
+                "DELETE FROM image_artifacts WHERE session_id = ?1 AND key_id = ?2",
+                params![&session_id, &key_id],
+            )?;
+            tx.execute(
+                "DELETE FROM task_events WHERE session_id = ?1 AND key_id = ?2",
+                params![&session_id, &key_id],
+            )?;
+            tx.execute(
+                "DELETE FROM image_tasks WHERE session_id = ?1 AND key_id = ?2",
+                params![&session_id, &key_id],
+            )?;
+            tx.execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND key_id = ?2",
+                params![&session_id, &key_id],
+            )?;
+            tx.execute(
+                "DELETE FROM sessions WHERE id = ?1 AND key_id = ?2",
+                params![&session_id, &key_id],
+            )?;
+            tx.commit()?;
+            Ok(Some(artifacts))
         })
         .await?
     }
@@ -952,7 +1141,7 @@ impl ControlDb {
                 r#"
                 SELECT id, key_id, title, source, status, created_at, updated_at, last_message_at
                 FROM sessions
-                WHERE key_id = ?1
+                WHERE key_id = ?1 AND status != 'deleted'
                 "#,
             );
             if let Some(cursor) = cursor_updated_before {
@@ -987,6 +1176,7 @@ impl ControlDb {
                 clauses.push("key_id = ?");
                 values.push(SqlValue::Text(key_id));
             }
+            clauses.push("status != 'deleted'");
             if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
                 clauses.push("title LIKE ?");
                 values.push(SqlValue::Text(format!("%{}%", query.trim())));
@@ -1229,6 +1419,16 @@ impl ControlDb {
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([session_id], image_task_from_row)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
+    /// Lists image tasks currently claimed by workers.
+    pub async fn list_running_image_tasks(&self) -> Result<Vec<ImageTaskRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ImageTaskRecord>> {
+            let conn = Connection::open(path)?;
+            list_tasks_by_status(&conn, "running")
         })
         .await?
     }
@@ -1600,7 +1800,8 @@ impl ControlDb {
                         event_flush_interval_seconds,
                         global_image_concurrency,
                         signed_link_ttl_seconds,
-                        queue_eta_window_size
+                        queue_eta_window_size,
+                        image_task_timeout_seconds
                     FROM runtime_config
                     WHERE id = 1
                     LIMIT 1
@@ -1795,17 +1996,13 @@ impl ControlDb {
         Ok(())
     }
 
-    /// Applies a successful usage settlement transaction and enqueues an outbox row.
+    /// Enqueues a successful usage event. DuckDB usage events are the billing ledger.
     pub async fn apply_success_settlement(&self, event: &UsageEventRecord) -> Result<()> {
         let path = self.path.clone();
         let event = event.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = Connection::open(path)?;
             let tx = conn.transaction()?;
-            tx.execute(
-                "UPDATE api_keys SET quota_used_calls = quota_used_calls + ?2 WHERE id = ?1",
-                params![&event.key_id, event.billable_images],
-            )?;
             tx.execute(
                 "INSERT INTO event_outbox (id, event_kind, payload_json, created_at, flushed_at) VALUES (?1, 'usage_event', ?2, ?3, NULL)",
                 params![&event.event_id, serde_json::to_string(&event)?, event.created_at],
@@ -1816,6 +2013,41 @@ impl ControlDb {
         .await??;
 
         Ok(())
+    }
+
+    /// Sums billable credits in usage events that have not reached DuckDB yet.
+    pub async fn sum_pending_billable_credits_for_key(&self, key_id: &str) -> Result<i64> {
+        let path = self.path.clone();
+        let key_id = key_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = Connection::open(path)?;
+            let mut stmt = conn.prepare(
+                "SELECT payload_json FROM event_outbox WHERE flushed_at IS NULL AND event_kind = 'usage_event'",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut total = 0_i64;
+            for row in rows {
+                let payload_json = row?;
+                let event = serde_json::from_str::<UsageEventRecord>(&payload_json).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            error.into(),
+                        )
+                    },
+                )?;
+                if event.key_id == key_id {
+                    total += if event.billable_credits > 0 {
+                        event.billable_credits
+                    } else {
+                        event.billable_images
+                    };
+                }
+            }
+            Ok(total)
+        })
+        .await?
     }
 
     /// Deletes one downstream API key by stable id and returns whether a row was removed.

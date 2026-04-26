@@ -74,6 +74,7 @@ async fn auto_route_honors_account_group_subset_before_global_quota_ordering() {
         quota_used_calls: 0,
         route_strategy: "auto".to_string(),
         account_group_id: Some("group-beta".to_string()),
+        fixed_account_name: None,
         request_max_concurrency: None,
         request_min_start_interval_ms: None,
         role: ApiKeyRole::User,
@@ -122,4 +123,78 @@ async fn auto_route_honors_account_group_subset_before_global_quota_ordering() {
         .expect("request should stay inside beta subset");
 
     assert_eq!(result.text, "beta wins");
+}
+
+#[tokio::test]
+async fn fixed_route_can_bind_directly_to_one_account_name() {
+    let (_temp, _paths, storage, service, mock) = build_service_test_app().await;
+
+    let mut alpha = AccountRecord::minimal("alpha", "alpha-token");
+    alpha.quota_known = true;
+    alpha.quota_remaining = 100;
+    storage.control.upsert_account(&alpha).await.expect("seed alpha");
+
+    let mut beta = AccountRecord::minimal("beta", "beta-token");
+    beta.quota_known = true;
+    beta.quota_remaining = 1;
+    storage.control.upsert_account(&beta).await.expect("seed beta");
+
+    let key = ApiKeyRecord {
+        id: "fixed-key".to_string(),
+        name: "fixed-key".to_string(),
+        secret_hash: "hash".to_string(),
+        secret_plaintext: None,
+        status: "active".to_string(),
+        quota_total_calls: 10,
+        quota_used_calls: 0,
+        route_strategy: "fixed".to_string(),
+        account_group_id: None,
+        fixed_account_name: Some("beta".to_string()),
+        request_max_concurrency: None,
+        request_min_start_interval_ms: None,
+        role: ApiKeyRole::User,
+        notification_email: None,
+        notification_enabled: false,
+    };
+    storage.control.upsert_api_key(&key).await.expect("seed key");
+
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/sentinel/chat-requirements"))
+        .and(header("authorization", "Bearer alpha-token"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("alpha should not be selected"))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/sentinel/chat-requirements"))
+        .and(header("authorization", "Bearer beta-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token": "chat-token",
+            "proofofwork": { "required": false }
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/conversation"))
+        .and(header("authorization", "Bearer beta-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            concat!(
+                "data: {\"conversation_id\":\"conv-2\",\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"content_type\":\"text\",\"parts\":[\"beta fixed\"]}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            "text/event-stream",
+        ))
+        .mount(&mock)
+        .await;
+
+    let result = service
+        .complete_text_for_key(&key, "Say hello", "auto", "/v1/chat/completions")
+        .await
+        .expect("request should use fixed beta account");
+
+    assert_eq!(result.text, "beta fixed");
 }

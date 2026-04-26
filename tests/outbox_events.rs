@@ -1,4 +1,4 @@
-//! Usage settlement and outbox enqueue tests.
+//! Usage-event ledger enqueue tests.
 
 use gpt2api_rs::config::ResolvedPaths;
 use gpt2api_rs::models::{AccountRecord, ApiKeyRecord, UsageEventRecord};
@@ -6,9 +6,9 @@ use gpt2api_rs::storage::Storage;
 use gpt2api_rs::usage::record_successful_generation;
 use tempfile::tempdir;
 
-/// Increments API-key usage and enqueues one outbox record for a successful generation.
+/// Leaves mutable key counters unchanged and enqueues the billable usage event.
 #[tokio::test]
-async fn successful_generation_updates_key_and_enqueues_outbox() {
+async fn successful_generation_enqueues_outbox_without_mutating_key_counter() {
     let temp = tempdir().expect("temp dir");
     let paths = ResolvedPaths::new(temp.path().to_path_buf());
     let storage = Storage::open(&paths).await.expect("storage opens");
@@ -33,8 +33,9 @@ async fn successful_generation_updates_key_and_enqueues_outbox() {
 
     let key =
         storage.control.get_api_key("key_1").await.expect("api key fetch").expect("api key exists");
-    let outbox = storage.control.list_pending_outbox().await.expect("list outbox");
+    let outbox = storage.control.list_pending_outbox_rows(10).await.expect("list outbox");
 
-    assert_eq!(key.quota_used_calls, 2);
+    assert_eq!(key.quota_used_calls, 0);
     assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].payload.billable_credits, 2);
 }

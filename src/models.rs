@@ -534,6 +534,8 @@ pub struct RuntimeConfigRecord {
     pub signed_link_ttl_seconds: i64,
     /// ETA averaging window size.
     pub queue_eta_window_size: i64,
+    /// Maximum runtime for one claimed image task.
+    pub image_task_timeout_seconds: i64,
 }
 
 /// A signed link row with only hashed token persisted.
@@ -599,6 +601,8 @@ pub struct ApiKeyRecord {
     pub route_strategy: String,
     /// Optional bound account-group id.
     pub account_group_id: Option<String>,
+    /// Optional directly bound upstream account name for fixed routing.
+    pub fixed_account_name: Option<String>,
     /// Optional per-key concurrency cap.
     pub request_max_concurrency: Option<u64>,
     /// Optional per-key minimum start interval in milliseconds.
@@ -609,6 +613,18 @@ pub struct ApiKeyRecord {
     pub notification_email: Option<String>,
     /// Whether completion email notifications are enabled.
     pub notification_enabled: bool,
+}
+
+/// Reusable account group used by downstream API-key routing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountGroupRecord {
+    /// Stable account-group identifier.
+    pub id: String,
+    /// Human-readable group label.
+    pub name: String,
+    /// Member upstream account names.
+    #[serde(default)]
+    pub account_names: Vec<String>,
 }
 
 impl ApiKeyRecord {
@@ -625,6 +641,7 @@ impl ApiKeyRecord {
             quota_used_calls: 0,
             route_strategy: "auto".to_string(),
             account_group_id: None,
+            fixed_account_name: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             role: ApiKeyRole::User,
@@ -703,16 +720,70 @@ pub struct UsageEventRecord {
     pub account_name: String,
     /// Public endpoint that received the request.
     pub endpoint: String,
+    /// Downstream HTTP method.
+    #[serde(default)]
+    pub request_method: String,
+    /// Downstream request URL path.
+    #[serde(default)]
+    pub request_url: String,
     /// Requested external model name.
     pub requested_model: String,
     /// Resolved upstream model slug.
     pub resolved_upstream_model: String,
+    /// Product/API session id associated with this event.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Image task id associated with this event.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Request mode, for example generation, edit, or text.
+    #[serde(default)]
+    pub mode: String,
+    /// Requested image size such as 1024x1024.
+    #[serde(default)]
+    pub image_size: Option<String>,
     /// Requested image count.
     pub requested_n: i64,
     /// Generated image count.
     pub generated_n: i64,
-    /// Billable image count.
+    /// Billable image count kept for OpenAI-compatible image semantics.
     pub billable_images: i64,
+    /// Billable credit units charged to the downstream key.
+    #[serde(default)]
+    pub billable_credits: i64,
+    /// Per-image credit units derived from requested size.
+    #[serde(default)]
+    pub size_credit_units: i64,
+    /// Number of prior text snippets injected into image context.
+    #[serde(default)]
+    pub context_text_count: i64,
+    /// Number of prior generated images summarized into image context.
+    #[serde(default)]
+    pub context_image_count: i64,
+    /// Extra credit units charged because session context was used.
+    #[serde(default)]
+    pub context_credit_surcharge: i64,
+    /// Client IP derived from trusted proxy headers or direct metadata.
+    #[serde(default)]
+    pub client_ip: String,
+    /// Sanitized request headers JSON.
+    #[serde(default)]
+    pub request_headers_json: Option<String>,
+    /// Prompt preview for search/debugging.
+    #[serde(default)]
+    pub prompt_preview: Option<String>,
+    /// Last user-visible message or prompt extracted from the request.
+    #[serde(default)]
+    pub last_message_content: Option<String>,
+    /// Full request body retained only for failed requests.
+    #[serde(default)]
+    pub request_body_json: Option<String>,
+    /// Raw user prompt length.
+    #[serde(default)]
+    pub prompt_chars: i64,
+    /// Effective upstream prompt length after session context injection.
+    #[serde(default)]
+    pub effective_prompt_chars: i64,
     /// Final HTTP status code exposed to the caller.
     pub status_code: i64,
     /// End-to-end latency in milliseconds.
@@ -745,11 +816,29 @@ impl UsageEventRecord {
             key_name: key_name.to_string(),
             account_name: account_name.to_string(),
             endpoint: "/v1/images/generations".to_string(),
+            request_method: "POST".to_string(),
+            request_url: "/v1/images/generations".to_string(),
             requested_model: "gpt-image-1".to_string(),
             resolved_upstream_model: "auto".to_string(),
+            session_id: None,
+            task_id: None,
+            mode: "generation".to_string(),
+            image_size: Some("1024x1024".to_string()),
             requested_n: billable_images,
             generated_n: billable_images,
             billable_images,
+            billable_credits: billable_images,
+            size_credit_units: 1,
+            context_text_count: 0,
+            context_image_count: 0,
+            context_credit_surcharge: 0,
+            client_ip: String::new(),
+            request_headers_json: None,
+            prompt_preview: None,
+            last_message_content: None,
+            request_body_json: None,
+            prompt_chars: 0,
+            effective_prompt_chars: 0,
             status_code: 200,
             latency_ms: 0,
             error_code: None,

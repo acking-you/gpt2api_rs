@@ -4,19 +4,26 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use gpt2api_rs::{
     app::build_router,
     config::ResolvedPaths,
     models::{ApiKeyRecord, ApiKeyRole},
     service::AppService,
     storage::Storage,
-    upstream::chatgpt::ChatgptUpstreamClient,
+    upstream::chatgpt::{ChatgptUpstreamClient, GeneratedImageItem},
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
+
+const ONE_PIXEL_PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89,
+];
 
 async fn build_app() -> (TempDir, axum::Router, Storage) {
     let temp = tempdir().expect("tempdir");
@@ -53,6 +60,7 @@ async fn seed_key(storage: &Storage, id: &str, name: &str, secret: &str, role: A
             quota_used_calls: 0,
             route_strategy: "auto".to_string(),
             account_group_id: None,
+            fixed_account_name: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             role,
@@ -152,7 +160,7 @@ async fn image_message_creates_pending_assistant_message_and_queued_task() {
         "POST",
         &format!("/sessions/{session_id}/messages"),
         "sk-user-a",
-        json!({"kind":"image_generation","prompt":"draw a lake","model":"gpt-image-1","n":1}),
+        json!({"kind":"image_generation","prompt":"draw a lake","model":"gpt-image-1","n":1,"size":"1536x1024"}),
     )
     .await;
 
@@ -160,6 +168,127 @@ async fn image_message_creates_pending_assistant_message_and_queued_task() {
     assert_eq!(value["task"]["status"], "queued");
     assert_eq!(value["assistant_message"]["status"], "pending");
     assert_eq!(value["queue"]["position_ahead"], 0);
+    let request_json = value["task"]["request_json"].as_str().expect("request json");
+    let request: Value = serde_json::from_str(request_json).expect("task request json");
+    assert_eq!(request["size"], "1536x1024");
+    assert_eq!(request["billing"]["size_credit_units"], 2);
+    assert_eq!(request["billing"]["billable_credits"], 2);
+}
+
+#[tokio::test]
+async fn session_delete_removes_conversation_tasks_artifacts_and_records_api_event() {
+    let (_temp, app, storage) = build_app().await;
+    let (_status, created) =
+        json_request(app.clone(), "POST", "/sessions", "sk-user-a", json!({"title":"Trash me"}))
+            .await;
+    let session_id = created["session"]["id"].as_str().expect("session id");
+    let (_status, submitted) = json_request(
+        app.clone(),
+        "POST",
+        &format!("/sessions/{session_id}/messages"),
+        "sk-user-a",
+        json!({"kind":"image_generation","prompt":"draw a lake","model":"gpt-image-2","n":1}),
+    )
+    .await;
+    let task_id = submitted["task"]["id"].as_str().expect("task id");
+    let assistant_message_id =
+        submitted["assistant_message"]["id"].as_str().expect("assistant message id");
+    let artifact = storage
+        .artifacts
+        .write_generated_image(
+            task_id,
+            session_id,
+            assistant_message_id,
+            "user-a",
+            &GeneratedImageItem {
+                b64_json: BASE64.encode(ONE_PIXEL_PNG),
+                revised_prompt: "lake".to_string(),
+            },
+            0,
+        )
+        .await
+        .expect("artifact file written");
+    let artifact_path = _temp.path().join(&artifact.relative_path);
+    storage.control.insert_image_artifact(&artifact).await.expect("artifact row");
+    storage
+        .control
+        .append_task_event(task_id, "phase", json!({"phase":"saving"}))
+        .await
+        .expect("task event");
+    let signed_link = storage
+        .control
+        .create_signed_link("image_task", task_id, 100, 3600)
+        .await
+        .expect("signed link");
+    assert!(artifact_path.is_file());
+    assert!(storage
+        .control
+        .resolve_signed_link(&signed_link.plaintext_token, 101)
+        .await
+        .expect("link lookup")
+        .is_some());
+
+    let (delete_status, value) = json_request(
+        app.clone(),
+        "DELETE",
+        &format!("/sessions/{session_id}"),
+        "sk-user-a",
+        json!({}),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(value["deleted"], true);
+
+    let (_list_status, list) =
+        json_request(app, "GET", "/sessions?limit=20", "sk-user-a", json!({})).await;
+    assert!(list["items"].as_array().expect("items").is_empty());
+    assert!(storage
+        .control
+        .get_session_for_admin(session_id)
+        .await
+        .expect("admin session lookup")
+        .is_none());
+    assert!(storage
+        .control
+        .list_messages_for_session(session_id)
+        .await
+        .expect("messages")
+        .is_empty());
+    assert!(storage.control.list_tasks_for_session(session_id).await.expect("tasks").is_empty());
+    assert!(storage
+        .control
+        .list_artifacts_for_session(session_id)
+        .await
+        .expect("artifacts")
+        .is_empty());
+    assert!(storage
+        .control
+        .list_task_events_for_session_after(session_id, 0, 20)
+        .await
+        .expect("task events")
+        .is_empty());
+    assert!(storage
+        .control
+        .get_image_artifact(&artifact.id)
+        .await
+        .expect("artifact lookup")
+        .is_none());
+    assert!(storage.control.get_image_task(task_id).await.expect("task lookup").is_none());
+    assert!(!artifact_path.exists());
+    assert!(storage
+        .control
+        .resolve_signed_link(&signed_link.plaintext_token, 101)
+        .await
+        .expect("link lookup after delete")
+        .is_none());
+
+    let outbox = storage.control.list_pending_outbox_rows(20).await.expect("outbox");
+    assert!(outbox.iter().any(|row| {
+        row.payload.request_method == "DELETE"
+            && row.payload.request_url == format!("/sessions/{session_id}")
+            && row.payload.status_code == 200
+            && row.payload.billable_credits == 0
+    }));
 }
 
 #[tokio::test]
@@ -193,11 +322,12 @@ async fn admin_key_can_update_global_queue_concurrency() {
         "PATCH",
         "/admin/queue/config",
         "sk-admin-a",
-        json!({"global_image_concurrency":2}),
+        json!({"global_image_concurrency":2,"image_task_timeout_seconds":600}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["config"]["global_image_concurrency"], 2);
+    assert_eq!(value["config"]["image_task_timeout_seconds"], 600);
 
     let (user_status, _user_value) = json_request(
         app,

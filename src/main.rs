@@ -46,6 +46,7 @@ async fn build_runtime_router(
         AppService::new(storage, command.admin_token.clone(), ChatgptUpstreamClient::default())
             .await?,
     );
+    service.recover_interrupted_image_tasks().await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     std::mem::drop(Arc::clone(&service).spawn_limited_account_refresher(shutdown_rx.clone()));
     std::mem::drop(Arc::clone(&service).spawn_outbox_flusher(shutdown_rx.clone()));

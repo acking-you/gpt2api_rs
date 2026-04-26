@@ -64,6 +64,7 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             quota_used_calls INTEGER NOT NULL DEFAULT 0,
             route_strategy TEXT NOT NULL,
             account_group_id TEXT,
+            fixed_account_name TEXT,
             request_max_concurrency INTEGER,
             request_min_start_interval_ms INTEGER,
             role TEXT NOT NULL DEFAULT 'user',
@@ -82,7 +83,8 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             event_flush_interval_seconds INTEGER NOT NULL,
             global_image_concurrency INTEGER NOT NULL DEFAULT 1,
             signed_link_ttl_seconds INTEGER NOT NULL DEFAULT 604800,
-            queue_eta_window_size INTEGER NOT NULL DEFAULT 20
+            queue_eta_window_size INTEGER NOT NULL DEFAULT 20,
+            image_task_timeout_seconds INTEGER NOT NULL DEFAULT 900
         );
 
         CREATE TABLE IF NOT EXISTS event_outbox (
@@ -129,11 +131,29 @@ pub fn bootstrap_event_schema(conn: &DuckConnection) -> Result<()> {
             key_name TEXT,
             account_name TEXT,
             endpoint TEXT,
+            request_method TEXT,
+            request_url TEXT,
             requested_model TEXT,
             resolved_upstream_model TEXT,
+            session_id TEXT,
+            task_id TEXT,
+            mode TEXT,
+            image_size TEXT,
             requested_n BIGINT,
             generated_n BIGINT,
             billable_images BIGINT,
+            billable_credits BIGINT,
+            size_credit_units BIGINT,
+            context_text_count BIGINT,
+            context_image_count BIGINT,
+            context_credit_surcharge BIGINT,
+            client_ip TEXT,
+            request_headers_json TEXT,
+            prompt_preview TEXT,
+            last_message_content TEXT,
+            request_body_json TEXT,
+            prompt_chars BIGINT,
+            effective_prompt_chars BIGINT,
             status_code BIGINT,
             latency_ms BIGINT,
             error_code TEXT,
@@ -141,6 +161,24 @@ pub fn bootstrap_event_schema(conn: &DuckConnection) -> Result<()> {
             detail_ref TEXT,
             created_at BIGINT
         );
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_method TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_url TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS session_id TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS task_id TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS mode TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS image_size TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS billable_credits BIGINT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS size_credit_units BIGINT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS context_text_count BIGINT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS context_image_count BIGINT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS context_credit_surcharge BIGINT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS client_ip TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_headers_json TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS prompt_preview TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS last_message_content TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_body_json TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS prompt_chars BIGINT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS effective_prompt_chars BIGINT;
         "#,
     )?;
     Ok(())
@@ -199,6 +237,9 @@ fn ensure_api_key_secret_plaintext_column(conn: &SqliteConnection) -> Result<()>
 
 fn ensure_api_key_product_columns(conn: &SqliteConnection) -> Result<()> {
     let columns = table_columns(conn, "api_keys")?;
+    if !columns.iter().any(|column| column == "fixed_account_name") {
+        conn.execute_batch("ALTER TABLE api_keys ADD COLUMN fixed_account_name TEXT")?;
+    }
     if !columns.iter().any(|column| column == "role") {
         conn.execute_batch("ALTER TABLE api_keys ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")?;
     }
@@ -230,6 +271,11 @@ fn ensure_runtime_config_product_columns(conn: &SqliteConnection) -> Result<()> 
             "ALTER TABLE runtime_config ADD COLUMN queue_eta_window_size INTEGER NOT NULL DEFAULT 20",
         )?;
     }
+    if !columns.iter().any(|column| column == "image_task_timeout_seconds") {
+        conn.execute_batch(
+            "ALTER TABLE runtime_config ADD COLUMN image_task_timeout_seconds INTEGER NOT NULL DEFAULT 900",
+        )?;
+    }
     Ok(())
 }
 
@@ -247,7 +293,8 @@ fn ensure_runtime_config_row(conn: &SqliteConnection) -> Result<()> {
             event_flush_interval_seconds,
             global_image_concurrency,
             signed_link_ttl_seconds,
-            queue_eta_window_size
+            queue_eta_window_size,
+            image_task_timeout_seconds
         ) VALUES (
             1,
             300,
@@ -259,7 +306,8 @@ fn ensure_runtime_config_row(conn: &SqliteConnection) -> Result<()> {
             5,
             1,
             604800,
-            20
+            20,
+            900
         );
         "#,
     )?;
@@ -392,6 +440,11 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
         } else {
             "0"
         };
+    let select_fixed_account_name = if columns.iter().any(|column| column == "fixed_account_name") {
+        "fixed_account_name"
+    } else {
+        "NULL"
+    };
     let sql = format!(
         r#"
         BEGIN IMMEDIATE;
@@ -406,6 +459,7 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
             quota_used_calls INTEGER NOT NULL DEFAULT 0,
             route_strategy TEXT NOT NULL,
             account_group_id TEXT,
+            fixed_account_name TEXT,
             request_max_concurrency INTEGER,
             request_min_start_interval_ms INTEGER,
             role TEXT NOT NULL DEFAULT 'user',
@@ -422,6 +476,7 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
             quota_used_calls,
             route_strategy,
             account_group_id,
+            fixed_account_name,
             request_max_concurrency,
             request_min_start_interval_ms,
             role,
@@ -438,6 +493,7 @@ fn rebuild_api_keys_table(conn: &SqliteConnection) -> Result<()> {
             quota_used_calls,
             route_strategy,
             account_group_id,
+            {select_fixed_account_name},
             request_max_concurrency,
             request_min_start_interval_ms,
             {select_role},

@@ -56,7 +56,12 @@ impl ImageTaskRunner {
 
             let service = Arc::clone(&self.service);
             tokio::spawn(async move {
-                let _ = service.execute_claimed_image_task(task).await;
+                let _ = service
+                    .execute_claimed_image_task_with_timeout(
+                        task,
+                        config.image_task_timeout_seconds,
+                    )
+                    .await;
             });
         }
     }

@@ -17,7 +17,10 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     models::ApiKeyRecord,
-    service::{AppService, ImageEditInput, PublicAuthError, PublicAuthFailure},
+    service::{
+        AppService, ImageEditInput, ImageEditSubmission, ImageGenerationSubmission,
+        PublicAuthError, PublicAuthFailure, RequestLogContext,
+    },
     upstream::chatgpt::{ChatgptImageResult, ChatgptTextResult, ChatgptTextStream},
 };
 
@@ -32,14 +35,21 @@ pub struct ImageGenerationRequest {
     /// Requested image count.
     #[serde(default = "default_image_count")]
     pub n: usize,
+    /// Requested output size.
+    #[serde(default = "default_image_size")]
+    pub size: String,
 }
 
 fn default_image_model() -> String {
-    "gpt-image-1".to_string()
+    "gpt-image-2".to_string()
 }
 
 const fn default_image_count() -> usize {
     1
+}
+
+fn default_image_size() -> String {
+    "1024x1024".to_string()
 }
 
 /// Returns the binary version string.
@@ -67,6 +77,7 @@ pub async fn login(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let key = authenticate_key(&service, &headers).await?;
+    let key = service.key_with_ledger_usage(&key).await.map_err(AppError::internal)?;
     Ok(Json(json!({
     "ok": true,
     "version": env!("CARGO_PKG_VERSION"),
@@ -97,12 +108,20 @@ pub async fn generate_images(
         .await
         .map_err(map_public_request_error)?;
     let submission = service
-        .submit_image_generation_message(
+        .submit_image_generation_message_with_context(
             &key,
             &session.id,
             body.prompt.trim(),
             body.model.trim(),
             n,
+            ImageGenerationSubmission {
+                size: body.size.trim().to_string(),
+                request_context: request_context_from_headers(
+                    &headers,
+                    "POST",
+                    "/v1/images/generations",
+                ),
+            },
         )
         .await
         .map_err(map_public_request_error)?
@@ -126,6 +145,7 @@ pub async fn edit_images(
     let mut prompt = String::new();
     let mut model = default_image_model();
     let mut n = default_image_count();
+    let mut size = default_image_size();
     let mut image_data = None;
     let mut file_name = "image.png".to_string();
     let mut mime_type = "image/png".to_string();
@@ -150,6 +170,10 @@ pub async fn edit_images(
                     .map_err(|error| AppError::bad_request(error.to_string()))?
                     .parse::<usize>()
                     .map_err(|_| AppError::bad_request("n must be an integer"))?;
+            }
+            "size" => {
+                size =
+                    field.text().await.map_err(|error| AppError::bad_request(error.to_string()))?
             }
             "image" => {
                 file_name = field.file_name().unwrap_or("image.png").to_string();
@@ -176,13 +200,17 @@ pub async fn edit_images(
         .await
         .map_err(map_public_request_error)?;
     let submission = service
-        .submit_image_edit_message(
+        .submit_image_edit_message_with_context(
             &key,
             &session.id,
             prompt.trim(),
             model.trim(),
             validate_image_count(n)?,
-            ImageEditInput { image_data, file_name, mime_type },
+            ImageEditSubmission {
+                edit_input: ImageEditInput { image_data, file_name, mime_type },
+                size,
+                request_context: request_context_from_headers(&headers, "POST", "/v1/images/edits"),
+            },
         )
         .await
         .map_err(map_public_request_error)?
@@ -215,6 +243,7 @@ pub async fn create_chat_completion(
             return Err(AppError::bad_request("stream is not supported for image generation"));
         }
         let n = validate_image_count(body.get("n").and_then(Value::as_u64).unwrap_or(1) as usize)?;
+        let size = body.get("size").and_then(Value::as_str).unwrap_or("1024x1024");
         let session = service
             .resolve_api_session(&key, extract_session_header(&headers).as_deref())
             .await
@@ -222,11 +251,42 @@ pub async fn create_chat_completion(
         let submission = match extract_chat_image(&body)? {
             Some(edit_input) => {
                 service
-                    .submit_image_edit_message(&key, &session.id, &prompt, model, n, edit_input)
+                    .submit_image_edit_message_with_context(
+                        &key,
+                        &session.id,
+                        &prompt,
+                        model,
+                        n,
+                        ImageEditSubmission {
+                            edit_input,
+                            size: size.to_string(),
+                            request_context: request_context_from_headers(
+                                &headers,
+                                "POST",
+                                "/v1/chat/completions",
+                            ),
+                        },
+                    )
                     .await
             }
             None => {
-                service.submit_image_generation_message(&key, &session.id, &prompt, model, n).await
+                service
+                    .submit_image_generation_message_with_context(
+                        &key,
+                        &session.id,
+                        &prompt,
+                        model,
+                        n,
+                        ImageGenerationSubmission {
+                            size: size.to_string(),
+                            request_context: request_context_from_headers(
+                                &headers,
+                                "POST",
+                                "/v1/chat/completions",
+                            ),
+                        },
+                    )
+                    .await
             }
         }
         .map_err(map_public_request_error)?
@@ -250,7 +310,13 @@ pub async fn create_chat_completion(
         .map_err(map_public_request_error)?;
     if stream {
         let upstream = match service
-            .start_text_stream_for_key(&key, &prompt, model, "/v1/chat/completions")
+            .start_text_stream_for_key_with_context(
+                &key,
+                &prompt,
+                model,
+                "/v1/chat/completions",
+                request_context_from_headers(&headers, "POST", "/v1/chat/completions"),
+            )
             .await
         {
             Ok(upstream) => upstream,
@@ -278,21 +344,29 @@ pub async fn create_chat_completion(
         );
     }
 
-    let result =
-        match service.complete_text_for_key(&key, &prompt, model, "/v1/chat/completions").await {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = service
-                    .append_api_failed_assistant_message(
-                        &key,
-                        &session.id,
-                        &user_message.id,
-                        &error.to_string(),
-                    )
-                    .await;
-                return Err(map_public_request_error(error));
-            }
-        };
+    let result = match service
+        .complete_text_for_key_with_context(
+            &key,
+            &prompt,
+            model,
+            "/v1/chat/completions",
+            request_context_from_headers(&headers, "POST", "/v1/chat/completions"),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = service
+                .append_api_failed_assistant_message(
+                    &key,
+                    &session.id,
+                    &user_message.id,
+                    &error.to_string(),
+                )
+                .await;
+            return Err(map_public_request_error(error));
+        }
+    };
     service
         .append_api_assistant_text_message(&key, &session.id, &user_message.id, &result)
         .await
@@ -316,6 +390,7 @@ pub async fn create_response(
     }
     let model = body.get("model").and_then(Value::as_str).unwrap_or("gpt-5");
     if has_response_image_generation_tool(&body) {
+        let size = body.get("size").and_then(Value::as_str).unwrap_or("1024x1024");
         let session = service
             .resolve_api_session(&key, extract_session_header(&headers).as_deref())
             .await
@@ -323,19 +398,41 @@ pub async fn create_response(
         let submission = match extract_response_image(body.get("input"))? {
             Some(edit_input) => {
                 service
-                    .submit_image_edit_message(
+                    .submit_image_edit_message_with_context(
                         &key,
                         &session.id,
                         &prompt,
-                        "gpt-image-1",
+                        "gpt-image-2",
                         1,
-                        edit_input,
+                        ImageEditSubmission {
+                            edit_input,
+                            size: size.to_string(),
+                            request_context: request_context_from_headers(
+                                &headers,
+                                "POST",
+                                "/v1/responses",
+                            ),
+                        },
                     )
                     .await
             }
             None => {
                 service
-                    .submit_image_generation_message(&key, &session.id, &prompt, "gpt-image-1", 1)
+                    .submit_image_generation_message_with_context(
+                        &key,
+                        &session.id,
+                        &prompt,
+                        "gpt-image-2",
+                        1,
+                        ImageGenerationSubmission {
+                            size: size.to_string(),
+                            request_context: request_context_from_headers(
+                                &headers,
+                                "POST",
+                                "/v1/responses",
+                            ),
+                        },
+                    )
                     .await
             }
         }
@@ -358,7 +455,16 @@ pub async fn create_response(
         .append_api_user_text_message(&key, &session.id, &prompt, model, "/v1/responses")
         .await
         .map_err(map_public_request_error)?;
-    let result = match service.complete_text_for_key(&key, &prompt, model, "/v1/responses").await {
+    let result = match service
+        .complete_text_for_key_with_context(
+            &key,
+            &prompt,
+            model,
+            "/v1/responses",
+            request_context_from_headers(&headers, "POST", "/v1/responses"),
+        )
+        .await
+    {
         Ok(result) => result,
         Err(error) => {
             let _ = service
@@ -392,6 +498,66 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 fn extract_session_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-gpt2api-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn request_context_from_headers(headers: &HeaderMap, method: &str, url: &str) -> RequestLogContext {
+    RequestLogContext {
+        method: method.to_string(),
+        url: url.to_string(),
+        client_ip: extract_client_ip(headers),
+        request_headers_json: Some(sanitized_headers_json(headers)),
+    }
+}
+
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    for name in ["cf-connecting-ip", "x-real-ip", "x-client-ip"] {
+        if let Some(value) = header_value(headers, name) {
+            return value;
+        }
+    }
+    header_value(headers, "x-forwarded-for")
+        .and_then(|value| value.split(',').next().map(str::trim).map(ToString::to_string))
+        .filter(|value| !value.is_empty())
+        .or_else(|| header_value(headers, "forwarded").and_then(parse_forwarded_for))
+        .unwrap_or_default()
+}
+
+fn parse_forwarded_for(value: String) -> Option<String> {
+    value.split(';').find_map(|part| {
+        let (name, raw) = part.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("for") {
+            return None;
+        }
+        Some(raw.trim_matches('"').trim().to_string()).filter(|item| !item.is_empty())
+    })
+}
+
+fn sanitized_headers_json(headers: &HeaderMap) -> String {
+    let mut value = serde_json::Map::new();
+    for name in [
+        "user-agent",
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-client-ip",
+        "cf-connecting-ip",
+        "forwarded",
+        "referer",
+        "origin",
+    ] {
+        if let Some(header) = header_value(headers, name) {
+            value.insert(name.to_string(), json!(header));
+        }
+    }
+    Value::Object(value).to_string()
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())

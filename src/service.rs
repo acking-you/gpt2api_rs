@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -17,11 +17,12 @@ use uuid::Uuid;
 
 use crate::{
     accounts::import::{build_account_record, parse_access_token_seed, parse_session_seed},
+    activity::{RequestActivityGuard, RequestActivitySnapshot, RequestActivityTracker},
     config::SmtpConfig,
     models::{
-        AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole, BrowserProfile,
-        ImageSubmissionResult, ImageTaskRecord, MessageRecord, MessageStatus, ProxyConfigRecord,
-        SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
+        AccountGroupRecord, AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole,
+        BrowserProfile, ImageSubmissionResult, ImageTaskRecord, MessageRecord, MessageStatus,
+        ProxyConfigRecord, SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
     },
     notifications::{
         is_valid_notification_email, render_image_done_email, send_rendered_email,
@@ -31,8 +32,9 @@ use crate::{
     scheduler::{Lease, LocalRequestScheduler},
     storage::{control::CreateImageTaskInput, Storage},
     upstream::chatgpt::{
-        access_token_expires_at, is_token_invalid_error, ChatgptImageResult, ChatgptTextResult,
-        ChatgptTextStream, ChatgptUpstreamClient, GeneratedImageItem,
+        access_token_expires_at, is_token_invalid_error, ChatgptImageResult,
+        ChatgptImageTextResponse, ChatgptTextResult, ChatgptTextStream, ChatgptUpstreamClient,
+        GeneratedImageItem,
     },
 };
 
@@ -41,6 +43,10 @@ const DEFAULT_REFRESH_SECONDS: u64 = 300;
 const ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS: i64 = 300;
 const DEFAULT_OUTBOX_FLUSH_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_OUTBOX_FLUSH_BATCH_SIZE: u64 = 100;
+const DEFAULT_IMAGE_SIZE: &str = "1024x1024";
+const BASE_IMAGE_CREDIT_AREA: u64 = 1024 * 1024;
+const MIN_IMAGE_DIMENSION: u32 = 256;
+const MAX_IMAGE_DIMENSION: u32 = 4096;
 
 /// One operator-supplied account import item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +141,24 @@ pub struct ProxyConfigUpdate {
     pub status: Option<String>,
 }
 
+/// Mutable account-group fields allowed through the admin create surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountGroupCreate {
+    /// Human-readable account-group label.
+    pub name: String,
+    /// Upstream account names that belong to this group.
+    pub account_names: Vec<String>,
+}
+
+/// Mutable account-group fields allowed through the admin update surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountGroupUpdate {
+    /// Optional replacement account-group label.
+    pub name: Option<String>,
+    /// Optional replacement member account names.
+    pub account_names: Option<Vec<String>>,
+}
+
 /// Result of probing one stored proxy config against the upstream base URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfigCheckResult {
@@ -195,6 +219,8 @@ pub struct ApiKeyCreate {
     pub route_strategy: String,
     /// Optional bound account-group id.
     pub account_group_id: Option<String>,
+    /// Optional directly bound upstream account name for fixed routing.
+    pub fixed_account_name: Option<String>,
     /// Optional per-key concurrency cap.
     pub request_max_concurrency: Option<u64>,
     /// Optional per-key minimum start interval in milliseconds.
@@ -220,6 +246,8 @@ pub struct ApiKeyUpdate {
     pub route_strategy: Option<String>,
     /// Optional replacement account-group id. `Some(None)` clears the field.
     pub account_group_id: Option<Option<String>>,
+    /// Optional replacement fixed account name. `Some(None)` clears the field.
+    pub fixed_account_name: Option<Option<String>>,
     /// Optional replacement concurrency cap. `Some(None)` clears the field.
     pub request_max_concurrency: Option<Option<u64>>,
     /// Optional replacement minimum start interval. `Some(None)` clears the field.
@@ -248,7 +276,83 @@ struct ImageMessageInput<'a> {
     prompt: &'a str,
     model: &'a str,
     n: usize,
+    size: &'a str,
     edit_input: Option<ImageEditInput>,
+    request_context: RequestLogContext,
+}
+
+/// Sanitized downstream request metadata persisted into usage events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestLogContext {
+    /// Downstream HTTP method.
+    pub method: String,
+    /// Downstream request path.
+    pub url: String,
+    /// Client IP derived by the HTTP layer.
+    pub client_ip: String,
+    /// Sanitized request headers JSON.
+    pub request_headers_json: Option<String>,
+}
+
+/// Image-generation request options plus request metadata.
+#[derive(Debug, Clone)]
+pub struct ImageGenerationSubmission {
+    /// Requested output size.
+    pub size: String,
+    /// Downstream request metadata.
+    pub request_context: RequestLogContext,
+}
+
+/// Image-edit upload plus request metadata.
+#[derive(Debug, Clone)]
+pub struct ImageEditSubmission {
+    /// Uploaded edit image.
+    pub edit_input: ImageEditInput,
+    /// Requested output size.
+    pub size: String,
+    /// Downstream request metadata.
+    pub request_context: RequestLogContext,
+}
+
+impl RequestLogContext {
+    /// Builds internal metadata when no external HTTP request is available.
+    #[must_use]
+    pub fn internal(endpoint: &str) -> Self {
+        Self {
+            method: "POST".to_string(),
+            url: endpoint.to_string(),
+            client_ip: String::new(),
+            request_headers_json: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImagePromptContext {
+    effective_prompt: String,
+    billable_credits: i64,
+    size: String,
+    size_credit_units: i64,
+    context_text_count: i64,
+    context_image_count: i64,
+    context_credit_surcharge: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UsageEventContext {
+    request: RequestLogContext,
+    endpoint: String,
+    session_id: Option<String>,
+    task_id: Option<String>,
+    mode: String,
+    image_size: Option<String>,
+    size_credit_units: i64,
+    billable_credits: i64,
+    context_text_count: i64,
+    context_image_count: i64,
+    context_credit_surcharge: i64,
+    raw_prompt: String,
+    effective_prompt: String,
 }
 
 /// Shared runtime service backing public and admin HTTP handlers.
@@ -260,6 +364,7 @@ pub struct AppService {
     smtp_config: SmtpConfig,
     key_scheduler: Arc<LocalRequestScheduler>,
     account_scheduler: Arc<LocalRequestScheduler>,
+    request_activity: Arc<RequestActivityTracker>,
 }
 
 impl AppService {
@@ -276,6 +381,7 @@ impl AppService {
             smtp_config: SmtpConfig::from_env(),
             key_scheduler: Arc::new(LocalRequestScheduler::default()),
             account_scheduler: Arc::new(LocalRequestScheduler::default()),
+            request_activity: Arc::new(RequestActivityTracker::new()),
         };
         service.ensure_default_api_key().await?;
         Ok(service)
@@ -297,6 +403,18 @@ impl AppService {
     #[must_use]
     pub fn email_notifications_configured(&self) -> bool {
         self.smtp_config.is_complete()
+    }
+
+    /// Records one started API request for live admin activity metrics.
+    #[must_use]
+    pub fn request_activity_start(&self, key_id: &str) -> RequestActivityGuard {
+        self.request_activity.start(key_id)
+    }
+
+    /// Returns current total or per-key API request activity.
+    #[must_use]
+    pub fn request_activity_snapshot(&self, key_id: Option<&str>) -> RequestActivitySnapshot {
+        self.request_activity.snapshot(key_id)
     }
 
     /// Authenticates one downstream public API key from a bearer token.
@@ -326,7 +444,6 @@ impl AppService {
         if key.status != "active" {
             return Err(PublicAuthError::Disabled.into());
         }
-        ensure_key_can_consume(&key, 1)?;
         Ok(key)
     }
 
@@ -344,6 +461,42 @@ impl AppService {
         bearer: &str,
     ) -> std::result::Result<ApiKeyRecord, PublicAuthFailure> {
         self.authenticate_public_key(bearer).await
+    }
+
+    /// Returns a key clone with usage populated from DuckDB plus pending outbox events.
+    pub async fn key_with_ledger_usage(&self, key: &ApiKeyRecord) -> Result<ApiKeyRecord> {
+        let mut hydrated = key.clone();
+        hydrated.quota_used_calls = self.current_key_usage_credits(&key.id).await?;
+        Ok(hydrated)
+    }
+
+    /// Lists keys with usage populated from the immutable usage-event ledger.
+    pub async fn list_api_keys_with_ledger_usage(&self) -> Result<Vec<ApiKeyRecord>> {
+        let keys = self.storage.control.list_api_keys().await?;
+        let mut hydrated = Vec::with_capacity(keys.len());
+        for key in keys {
+            hydrated.push(self.key_with_ledger_usage(&key).await?);
+        }
+        Ok(hydrated)
+    }
+
+    /// Returns persisted DuckDB usage plus not-yet-flushed outbox usage for one key.
+    pub async fn current_key_usage_credits(&self, key_id: &str) -> Result<i64> {
+        let persisted = self.storage.events.sum_billable_credits_for_key(key_id).await?;
+        let pending = self.storage.control.sum_pending_billable_credits_for_key(key_id).await?;
+        Ok(persisted.saturating_add(pending))
+    }
+
+    async fn ensure_key_can_consume_current(&self, key: &ApiKeyRecord, cost: i64) -> Result<()> {
+        if key.status != "active" {
+            bail!(PublicAuthError::Disabled.to_string());
+        }
+        if cost <= 0 {
+            return Ok(());
+        }
+        let used = self.current_key_usage_credits(&key.id).await?;
+        let current = ApiKeyRecord { quota_used_calls: used, ..key.clone() };
+        ensure_key_can_consume(&current, cost).map_err(|error| anyhow!(error.to_string()))
     }
 
     /// Returns whether a key has product-admin privileges.
@@ -431,6 +584,21 @@ impl AppService {
         Ok(Some(self.build_session_detail(session).await?))
     }
 
+    /// Permanently deletes one key-scoped session and its stored conversation artifacts.
+    pub async fn delete_session_for_key(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+    ) -> Result<bool> {
+        let Some(artifacts) =
+            self.storage.control.hard_delete_session_for_key(session_id, &key.id).await?
+        else {
+            return Ok(false);
+        };
+        self.storage.artifacts.delete_artifacts(&artifacts).await?;
+        Ok(true)
+    }
+
     /// Appends a user text message, completes it immediately, and returns the session detail.
     pub async fn submit_text_message(
         &self,
@@ -501,6 +669,31 @@ impl AppService {
         prompt: &str,
         model: &str,
         n: usize,
+        size: &str,
+    ) -> Result<Option<ImageSubmissionResult>> {
+        self.submit_image_generation_message_with_context(
+            key,
+            session_id,
+            prompt,
+            model,
+            n,
+            ImageGenerationSubmission {
+                size: size.to_string(),
+                request_context: RequestLogContext::internal("/v1/images/generations"),
+            },
+        )
+        .await
+    }
+
+    /// Queues one image-generation message with downstream request metadata.
+    pub async fn submit_image_generation_message_with_context(
+        &self,
+        key: &ApiKeyRecord,
+        session_id: &str,
+        prompt: &str,
+        model: &str,
+        n: usize,
+        submission: ImageGenerationSubmission,
     ) -> Result<Option<ImageSubmissionResult>> {
         self.submit_image_message(ImageMessageInput {
             key,
@@ -509,20 +702,22 @@ impl AppService {
             prompt,
             model,
             n,
+            size: &submission.size,
             edit_input: None,
+            request_context: submission.request_context,
         })
         .await
     }
 
-    /// Queues one image-edit message for a web session.
-    pub async fn submit_image_edit_message(
+    /// Queues one image-edit message with downstream request metadata.
+    pub async fn submit_image_edit_message_with_context(
         &self,
         key: &ApiKeyRecord,
         session_id: &str,
         prompt: &str,
         model: &str,
         n: usize,
-        edit_input: ImageEditInput,
+        submission: ImageEditSubmission,
     ) -> Result<Option<ImageSubmissionResult>> {
         self.submit_image_message(ImageMessageInput {
             key,
@@ -531,7 +726,9 @@ impl AppService {
             prompt,
             model,
             n,
-            edit_input: Some(edit_input),
+            size: &submission.size,
+            edit_input: Some(submission.edit_input),
+            request_context: submission.request_context,
         })
         .await
     }
@@ -549,7 +746,10 @@ impl AppService {
         let prompt = normalize_required_string(input.prompt, "prompt")?;
         let model = normalize_required_string(input.model, "model")?;
         let n = input.n.clamp(1, 4);
-        ensure_key_can_consume(key, n as i64).map_err(|error| anyhow!(error.to_string()))?;
+        let size = normalize_image_size(input.size)?;
+        let existing_detail = self.build_session_detail(session.clone()).await?;
+        let image_context = build_session_aware_image_prompt(&existing_detail, &prompt, n, &size);
+        self.ensure_key_can_consume_current(key, image_context.billable_credits).await?;
         let user_message = self
             .storage
             .control
@@ -557,7 +757,7 @@ impl AppService {
                 &session.id,
                 &key.id,
                 "user",
-                image_prompt_message_content(input.mode, &prompt, &model, n),
+                image_prompt_message_content(input.mode, &prompt, &model, n, &size),
                 MessageStatus::Done,
             )
             .await?;
@@ -572,8 +772,15 @@ impl AppService {
                 MessageStatus::Pending,
             )
             .await?;
-        let request_json =
-            image_task_request_json(input.mode, &prompt, &model, n, input.edit_input.as_ref());
+        let request_json = image_task_request_json(
+            input.mode,
+            &prompt,
+            &model,
+            n,
+            input.edit_input.as_ref(),
+            &image_context,
+            &input.request_context,
+        );
         let task = self
             .storage
             .control
@@ -702,7 +909,13 @@ impl AppService {
                 .await?
             {
                 let claimed_id = claimed.id.clone();
-                if let Err(error) = self.execute_claimed_image_task(claimed).await {
+                if let Err(error) = self
+                    .execute_claimed_image_task_with_timeout(
+                        claimed,
+                        config.image_task_timeout_seconds,
+                    )
+                    .await
+                {
                     if claimed_id == task_id {
                         return Err(error);
                     }
@@ -942,9 +1155,132 @@ impl AppService {
         })
     }
 
+    /// Lists all reusable account groups.
+    pub async fn list_account_groups(&self) -> Result<Vec<AccountGroupRecord>> {
+        self.storage.control.list_account_groups().await
+    }
+
+    /// Creates one reusable account group.
+    pub async fn create_account_group(
+        &self,
+        input: &AccountGroupCreate,
+    ) -> Result<AccountGroupRecord> {
+        let account_names = self.normalize_account_group_members(&input.account_names).await?;
+        let record = AccountGroupRecord {
+            id: format!("group_{}", Uuid::new_v4().simple()),
+            name: normalize_required_string(&input.name, "name")?,
+            account_names,
+        };
+        self.storage.control.upsert_account_group(&record).await?;
+        Ok(record)
+    }
+
+    /// Updates one reusable account group and returns the updated row.
+    pub async fn update_account_group(
+        &self,
+        group_id: &str,
+        update: &AccountGroupUpdate,
+    ) -> Result<Option<AccountGroupRecord>> {
+        let Some(mut record) = self.storage.control.get_account_group(group_id).await? else {
+            return Ok(None);
+        };
+        if let Some(name) = update.name.as_deref() {
+            record.name = normalize_required_string(name, "name")?;
+        }
+        if let Some(account_names) = &update.account_names {
+            record.account_names = self.normalize_account_group_members(account_names).await?;
+        }
+        self.storage.control.upsert_account_group(&record).await?;
+        Ok(Some(record))
+    }
+
+    /// Deletes one reusable account group when no API key still references it.
+    pub async fn delete_account_group(&self, group_id: &str) -> Result<bool> {
+        let keys = self.storage.control.list_api_keys().await?;
+        if keys.iter().any(|key| key.account_group_id.as_deref() == Some(group_id)) {
+            bail!("account group `{group_id}` is still bound to one or more keys");
+        }
+        self.storage.control.delete_account_group(group_id).await
+    }
+
+    async fn normalize_account_group_members(&self, names: &[String]) -> Result<Vec<String>> {
+        let known_accounts: HashSet<_> = self
+            .storage
+            .control
+            .list_accounts()
+            .await?
+            .into_iter()
+            .map(|account| account.name)
+            .collect();
+        let mut normalized = Vec::new();
+        let mut seen = HashSet::new();
+        for name in names {
+            let name = normalize_required_string(name, "account_name")?;
+            if !known_accounts.contains(&name) {
+                bail!("unknown account `{name}`");
+            }
+            if seen.insert(name.clone()) {
+                normalized.push(name);
+            }
+        }
+        normalized.sort();
+        Ok(normalized)
+    }
+
+    async fn validate_api_key_route_config(
+        &self,
+        route_strategy: &str,
+        account_group_id: Option<&str>,
+        fixed_account_name: Option<&str>,
+    ) -> Result<()> {
+        if fixed_account_name.is_some() && account_group_id.is_some() {
+            bail!("route can bind either an account group or a single account, not both");
+        }
+        if let Some(account_name) = fixed_account_name {
+            if !route_strategy.eq_ignore_ascii_case("fixed") {
+                bail!("single-account binding requires fixed routing");
+            }
+            let account = self
+                .storage
+                .control
+                .get_account(account_name)
+                .await?
+                .ok_or_else(|| anyhow!("account `{account_name}` not found"))?;
+            if !is_account_selectable(&account) {
+                bail!("account `{account_name}` is not selectable");
+            }
+            return Ok(());
+        }
+        let Some(group_id) = account_group_id else {
+            if route_strategy.eq_ignore_ascii_case("fixed") {
+                bail!("fixed route requires a fixed account or a single-account group");
+            }
+            return Ok(());
+        };
+        let group = self
+            .storage
+            .control
+            .get_account_group(group_id)
+            .await?
+            .ok_or_else(|| anyhow!("account group `{group_id}` not found"))?;
+        if route_strategy.eq_ignore_ascii_case("fixed") && group.account_names.len() != 1 {
+            bail!("fixed route requires an account group with exactly one account");
+        }
+        Ok(())
+    }
+
     /// Creates one downstream API key and returns the stored plaintext secret.
     pub async fn create_api_key(&self, input: &ApiKeyCreate) -> Result<ApiKeySecretRecord> {
         let secret_plaintext = generate_api_key_plaintext();
+        let route_strategy = normalize_route_strategy(&input.route_strategy)?;
+        let account_group_id = normalize_optional_string(input.account_group_id.as_deref());
+        let fixed_account_name = normalize_optional_string(input.fixed_account_name.as_deref());
+        self.validate_api_key_route_config(
+            &route_strategy,
+            account_group_id.as_deref(),
+            fixed_account_name.as_deref(),
+        )
+        .await?;
         let key = ApiKeyRecord {
             id: format!("key_{}", Uuid::new_v4().simple()),
             name: normalize_required_string(&input.name, "name")?,
@@ -953,8 +1289,9 @@ impl AppService {
             status: normalize_api_key_status(input.status.as_deref().unwrap_or("active"))?,
             quota_total_calls: validate_quota_total_calls(input.quota_total_calls)?,
             quota_used_calls: 0,
-            route_strategy: normalize_route_strategy(&input.route_strategy)?,
-            account_group_id: normalize_optional_string(input.account_group_id.as_deref()),
+            route_strategy,
+            account_group_id,
+            fixed_account_name,
             request_max_concurrency: input.request_max_concurrency,
             request_min_start_interval_ms: input.request_min_start_interval_ms,
             role: input.role.unwrap_or(ApiKeyRole::User),
@@ -989,6 +1326,9 @@ impl AppService {
         if let Some(account_group_id) = &update.account_group_id {
             key.account_group_id = normalize_optional_string(account_group_id.as_deref());
         }
+        if let Some(fixed_account_name) = &update.fixed_account_name {
+            key.fixed_account_name = normalize_optional_string(fixed_account_name.as_deref());
+        }
         if let Some(request_max_concurrency) = update.request_max_concurrency {
             key.request_max_concurrency = request_max_concurrency;
         }
@@ -1004,6 +1344,12 @@ impl AppService {
         if let Some(notification_enabled) = update.notification_enabled {
             key.notification_enabled = notification_enabled;
         }
+        self.validate_api_key_route_config(
+            &key.route_strategy,
+            key.account_group_id.as_deref(),
+            key.fixed_account_name.as_deref(),
+        )
+        .await?;
         self.storage.control.upsert_api_key(&key).await?;
         Ok(Some(key))
     }
@@ -1037,7 +1383,8 @@ impl AppService {
             .authenticate_public_key(bearer)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
-        self.generate_images_for_key(&key, prompt, requested_model, requested_n).await
+        self.generate_images_for_key(&key, prompt, requested_model, requested_n, DEFAULT_IMAGE_SIZE)
+            .await
     }
 
     /// Executes one image-edit request and returns the downstream image payload.
@@ -1053,7 +1400,15 @@ impl AppService {
             .authenticate_public_key(bearer)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
-        self.edit_images_for_key(&key, prompt, requested_model, requested_n, edit_input).await
+        self.edit_images_for_key(
+            &key,
+            prompt,
+            requested_model,
+            requested_n,
+            DEFAULT_IMAGE_SIZE,
+            edit_input,
+        )
+        .await
     }
 
     /// Executes one text-to-image request for an already authenticated key.
@@ -1063,14 +1418,24 @@ impl AppService {
         prompt: &str,
         requested_model: &str,
         requested_n: usize,
+        requested_size: &str,
     ) -> Result<ChatgptImageResult> {
+        let size = normalize_image_size(requested_size)?;
+        let size_credit_units = image_size_credit_units(&size);
+        let mut usage_context =
+            direct_usage_context("/v1/images/generations", "generation", prompt);
+        usage_context.image_size = Some(size.clone());
+        usage_context.size_credit_units = size_credit_units;
+        usage_context.billable_credits = requested_n.clamp(1, 4) as i64 * size_credit_units;
+        usage_context.effective_prompt = render_image_mode_prompt(&[], &[], prompt, &size);
+        let effective_prompt = usage_context.effective_prompt.clone();
         self.execute_public_image_request(
             key,
-            prompt,
+            &effective_prompt,
             requested_model,
             requested_n,
             None,
-            "/v1/images/generations",
+            usage_context,
         )
         .await
     }
@@ -1082,15 +1447,24 @@ impl AppService {
         prompt: &str,
         requested_model: &str,
         requested_n: usize,
+        requested_size: &str,
         edit_input: ImageEditInput,
     ) -> Result<ChatgptImageResult> {
+        let size = normalize_image_size(requested_size)?;
+        let size_credit_units = image_size_credit_units(&size);
+        let mut usage_context = direct_usage_context("/v1/images/edits", "edit", prompt);
+        usage_context.image_size = Some(size.clone());
+        usage_context.size_credit_units = size_credit_units;
+        usage_context.billable_credits = requested_n.clamp(1, 4) as i64 * size_credit_units;
+        usage_context.effective_prompt = render_image_mode_prompt(&[], &[], prompt, &size);
+        let effective_prompt = usage_context.effective_prompt.clone();
         self.execute_public_image_request(
             key,
-            prompt,
+            &effective_prompt,
             requested_model,
             requested_n,
             Some(edit_input),
-            "/v1/images/edits",
+            usage_context,
         )
         .await
     }
@@ -1103,7 +1477,29 @@ impl AppService {
         requested_model: &str,
         endpoint: &str,
     ) -> Result<ChatgptTextResult> {
-        self.execute_public_text_request(key, prompt, requested_model, endpoint).await
+        self.complete_text_for_key_with_context(
+            key,
+            prompt,
+            requested_model,
+            endpoint,
+            RequestLogContext::internal(endpoint),
+        )
+        .await
+    }
+
+    /// Executes one non-streaming text completion with downstream request metadata.
+    pub async fn complete_text_for_key_with_context(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        endpoint: &str,
+        request_context: RequestLogContext,
+    ) -> Result<ChatgptTextResult> {
+        let mut usage_context = direct_usage_context(endpoint, "text", prompt);
+        usage_context.request = request_context;
+        self.execute_public_text_request(key, prompt, requested_model, endpoint, usage_context)
+            .await
     }
 
     /// Opens one streaming text completion for an already authenticated key.
@@ -1114,7 +1510,28 @@ impl AppService {
         requested_model: &str,
         endpoint: &str,
     ) -> Result<ChatgptTextStream> {
-        self.start_public_text_stream(key, prompt, requested_model, endpoint).await
+        self.start_text_stream_for_key_with_context(
+            key,
+            prompt,
+            requested_model,
+            endpoint,
+            RequestLogContext::internal(endpoint),
+        )
+        .await
+    }
+
+    /// Opens one streaming text completion with downstream request metadata.
+    pub async fn start_text_stream_for_key_with_context(
+        &self,
+        key: &ApiKeyRecord,
+        prompt: &str,
+        requested_model: &str,
+        endpoint: &str,
+        request_context: RequestLogContext,
+    ) -> Result<ChatgptTextStream> {
+        let mut usage_context = direct_usage_context(endpoint, "text_stream", prompt);
+        usage_context.request = request_context;
+        self.start_public_text_stream(key, prompt, requested_model, endpoint, usage_context).await
     }
 
     /// Builds a chat.completions-compatible payload around the image gateway result.
@@ -1315,6 +1732,7 @@ impl AppService {
             quota_used_calls: 0,
             route_strategy: "auto".to_string(),
             account_group_id: None,
+            fixed_account_name: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             role: ApiKeyRole::User,
@@ -1331,11 +1749,102 @@ impl AppService {
         Ok(SessionDetail { session, messages, tasks, artifacts })
     }
 
+    /// Fails image tasks that were claimed by a previous process.
+    ///
+    /// A running task is owned by an in-process worker future. After a service restart that future
+    /// no longer exists, so the task cannot produce artifacts or worker updates. Leaving it as
+    /// running would permanently consume one global queue slot.
+    pub async fn recover_interrupted_image_tasks(&self) -> Result<usize> {
+        let tasks = self.storage.control.list_running_image_tasks().await?;
+        if tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let finished_at = unix_timestamp_secs();
+        let error_message =
+            "Image task interrupted because the gpt2api service restarted. Please send again.";
+        for task in &tasks {
+            self.storage
+                .control
+                .mark_image_task_failed(
+                    &task.id,
+                    finished_at,
+                    "image_task_interrupted",
+                    error_message,
+                )
+                .await?;
+            self.storage
+                .control
+                .update_message_content_status(
+                    &task.message_id,
+                    json!({
+                        "blocks": [{
+                            "type": "error",
+                            "text": error_message,
+                        }],
+                    }),
+                    MessageStatus::Failed,
+                )
+                .await?;
+        }
+
+        Ok(tasks.len())
+    }
+
+    /// Executes a queue-claimed image task with a hard runtime cap.
+    pub async fn execute_claimed_image_task_with_timeout(
+        &self,
+        task: ImageTaskRecord,
+        timeout_seconds: i64,
+    ) -> Result<()> {
+        let timeout_seconds = timeout_seconds.max(1) as u64;
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_seconds),
+            self.execute_claimed_image_task(task.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let error_message = format!(
+                    "Image task timed out after {timeout_seconds} seconds. Please send again."
+                );
+                self.storage
+                    .control
+                    .mark_image_task_failed(
+                        &task.id,
+                        unix_timestamp_secs(),
+                        "image_task_timeout",
+                        &error_message,
+                    )
+                    .await?;
+                self.storage
+                    .control
+                    .update_message_content_status(
+                        &task.message_id,
+                        json!({
+                            "blocks": [{
+                                "type": "error",
+                                "text": error_message,
+                            }],
+                        }),
+                        MessageStatus::Failed,
+                    )
+                    .await?;
+                bail!(error_message);
+            }
+        }
+    }
+
     /// Executes a queue-claimed image task and persists its artifacts.
     pub async fn execute_claimed_image_task(&self, task: ImageTaskRecord) -> Result<()> {
         match self.execute_claimed_image_task_inner(&task).await {
             Ok(()) => Ok(()),
             Err(error) => {
+                if let Some(text_response) = error.downcast_ref::<ChatgptImageTextResponse>() {
+                    self.finish_image_task_with_assistant_text(&task, text_response).await?;
+                    return Ok(());
+                }
                 let error_message = error.to_string();
                 let _ = self
                     .storage
@@ -1366,6 +1875,37 @@ impl AppService {
         }
     }
 
+    async fn finish_image_task_with_assistant_text(
+        &self,
+        task: &ImageTaskRecord,
+        text_response: &ChatgptImageTextResponse,
+    ) -> Result<()> {
+        let finished_at = unix_timestamp_secs();
+        self.storage
+            .control
+            .mark_image_task_phase(
+                &task.id,
+                "saving",
+                json!({ "phase": "saving", "assistant_text": true }),
+            )
+            .await?;
+        self.storage
+            .control
+            .update_message_content_status(
+                &task.message_id,
+                json!({
+                    "blocks": [{ "type": "text", "text": text_response.text }],
+                    "prompt": task.prompt,
+                    "model": text_response.resolved_model,
+                    "image_task_result": "assistant_text",
+                }),
+                MessageStatus::Done,
+            )
+            .await?;
+        self.storage.control.mark_image_task_succeeded(&task.id, finished_at, &[]).await?;
+        Ok(())
+    }
+
     async fn execute_claimed_image_task_inner(&self, task: &ImageTaskRecord) -> Result<()> {
         let Some(key) = self.storage.control.get_api_key(&task.key_id).await? else {
             bail!("api key not found for image task");
@@ -1387,14 +1927,16 @@ impl AppService {
             .control
             .mark_image_task_phase(&task.id, "running", json!({ "phase": "running" }))
             .await?;
+        let usage_context = usage_context_for_image_task(task, endpoint);
+        let effective_prompt = usage_context.effective_prompt.clone();
         let result = self
             .execute_public_image_request(
                 &key,
-                &task.prompt,
+                &effective_prompt,
                 &task.model,
                 task.n.max(1) as usize,
                 edit_input,
-                endpoint,
+                usage_context,
             )
             .await?;
         self.storage
@@ -1523,10 +2065,9 @@ impl AppService {
         requested_model: &str,
         requested_n: usize,
         edit_input: Option<ImageEditInput>,
-        endpoint: &str,
+        usage_context: UsageEventContext,
     ) -> Result<ChatgptImageResult> {
-        ensure_key_can_consume(key, requested_n as i64)
-            .map_err(|error| anyhow!(error.to_string()))?;
+        self.ensure_key_can_consume_current(key, usage_context.billable_credits).await?;
         let key_lease = self.acquire_key_lease(key).await?;
         let _keep_key_lease = key_lease;
 
@@ -1537,6 +2078,7 @@ impl AppService {
         let mut resolved_model = String::new();
         let mut selected_account_name = String::new();
         let mut last_error = None;
+        let mut text_response = None;
 
         for _ in 0..requested_n {
             let (account, lease) = self.acquire_account_for_key(key).await?;
@@ -1567,6 +2109,12 @@ impl AppService {
                     self.record_account_success(&account).await?;
                 }
                 Err(error) => {
+                    if let Some(response) = error.downcast_ref::<ChatgptImageTextResponse>() {
+                        self.record_account_success(&account).await?;
+                        resolved_model = response.resolved_model.clone();
+                        text_response = Some(response.clone());
+                        break;
+                    }
                     self.record_account_failure(&account, &error.to_string()).await?;
                     last_error = Some(error.to_string());
                     if is_token_invalid_error(&error.to_string()) {
@@ -1577,6 +2125,9 @@ impl AppService {
         }
 
         if images.is_empty() {
+            if let Some(response) = text_response {
+                return Err(response.into());
+            }
             bail!(last_error.unwrap_or_else(|| "image generation failed".to_string()));
         }
 
@@ -1595,12 +2146,30 @@ impl AppService {
             key_id: key.id.clone(),
             key_name: key.name.clone(),
             account_name: selected_account_name,
-            endpoint: endpoint.to_string(),
+            endpoint: usage_context.endpoint.clone(),
+            request_method: usage_context.request.method.clone(),
+            request_url: usage_context.request.url.clone(),
             requested_model: requested_model.to_string(),
             resolved_upstream_model: result.resolved_model.clone(),
+            session_id: usage_context.session_id.clone(),
+            task_id: usage_context.task_id.clone(),
+            mode: usage_context.mode.clone(),
+            image_size: usage_context.image_size.clone(),
             requested_n: requested_n as i64,
             generated_n: result.data.len() as i64,
             billable_images: result.data.len() as i64,
+            billable_credits: usage_context.billable_credits,
+            size_credit_units: usage_context.size_credit_units,
+            context_text_count: usage_context.context_text_count,
+            context_image_count: usage_context.context_image_count,
+            context_credit_surcharge: usage_context.context_credit_surcharge,
+            client_ip: usage_context.request.client_ip.clone(),
+            request_headers_json: usage_context.request.request_headers_json.clone(),
+            prompt_preview: prompt_preview(&usage_context.raw_prompt),
+            last_message_content: prompt_preview(&usage_context.raw_prompt),
+            request_body_json: None,
+            prompt_chars: usage_context.raw_prompt.chars().count() as i64,
+            effective_prompt_chars: usage_context.effective_prompt.chars().count() as i64,
             status_code: 200,
             latency_ms: started.elapsed().as_millis() as i64,
             error_code: None,
@@ -1618,8 +2187,9 @@ impl AppService {
         prompt: &str,
         requested_model: &str,
         endpoint: &str,
+        usage_context: UsageEventContext,
     ) -> Result<ChatgptTextResult> {
-        ensure_key_can_consume(key, 1).map_err(|error| anyhow!(error.to_string()))?;
+        self.ensure_key_can_consume_current(key, 1).await?;
         let key_lease = self.acquire_key_lease(key).await?;
         let _keep_key_lease = key_lease;
 
@@ -1651,11 +2221,30 @@ impl AppService {
                         key_name: key.name.clone(),
                         account_name: account.name.clone(),
                         endpoint: endpoint.to_string(),
+                        request_method: usage_context.request.method.clone(),
+                        request_url: usage_context.request.url.clone(),
                         requested_model: requested_model.to_string(),
                         resolved_upstream_model: result.resolved_model.clone(),
+                        session_id: usage_context.session_id.clone(),
+                        task_id: usage_context.task_id.clone(),
+                        mode: usage_context.mode.clone(),
+                        image_size: usage_context.image_size.clone(),
                         requested_n: 1,
                         generated_n: 1,
                         billable_images: 1,
+                        billable_credits: usage_context.billable_credits,
+                        size_credit_units: usage_context.size_credit_units,
+                        context_text_count: usage_context.context_text_count,
+                        context_image_count: usage_context.context_image_count,
+                        context_credit_surcharge: usage_context.context_credit_surcharge,
+                        client_ip: usage_context.request.client_ip.clone(),
+                        request_headers_json: usage_context.request.request_headers_json.clone(),
+                        prompt_preview: prompt_preview(&usage_context.raw_prompt),
+                        last_message_content: prompt_preview(&usage_context.raw_prompt),
+                        request_body_json: None,
+                        prompt_chars: usage_context.raw_prompt.chars().count() as i64,
+                        effective_prompt_chars: usage_context.effective_prompt.chars().count()
+                            as i64,
                         status_code: 200,
                         latency_ms: started.elapsed().as_millis() as i64,
                         error_code: None,
@@ -1686,8 +2275,9 @@ impl AppService {
         prompt: &str,
         requested_model: &str,
         endpoint: &str,
+        usage_context: UsageEventContext,
     ) -> Result<ChatgptTextStream> {
-        ensure_key_can_consume(key, 1).map_err(|error| anyhow!(error.to_string()))?;
+        self.ensure_key_can_consume_current(key, 1).await?;
         let key_lease = self.acquire_key_lease(key).await?;
         let _keep_key_lease = key_lease;
 
@@ -1719,11 +2309,30 @@ impl AppService {
                         key_name: key.name.clone(),
                         account_name: account.name.clone(),
                         endpoint: endpoint.to_string(),
+                        request_method: usage_context.request.method.clone(),
+                        request_url: usage_context.request.url.clone(),
                         requested_model: requested_model.to_string(),
                         resolved_upstream_model: stream.resolved_model.clone(),
+                        session_id: usage_context.session_id.clone(),
+                        task_id: usage_context.task_id.clone(),
+                        mode: usage_context.mode.clone(),
+                        image_size: usage_context.image_size.clone(),
                         requested_n: 1,
                         generated_n: 1,
                         billable_images: 1,
+                        billable_credits: usage_context.billable_credits,
+                        size_credit_units: usage_context.size_credit_units,
+                        context_text_count: usage_context.context_text_count,
+                        context_image_count: usage_context.context_image_count,
+                        context_credit_surcharge: usage_context.context_credit_surcharge,
+                        client_ip: usage_context.request.client_ip.clone(),
+                        request_headers_json: usage_context.request.request_headers_json.clone(),
+                        prompt_preview: prompt_preview(&usage_context.raw_prompt),
+                        last_message_content: prompt_preview(&usage_context.raw_prompt),
+                        request_body_json: None,
+                        prompt_chars: usage_context.raw_prompt.chars().count() as i64,
+                        effective_prompt_chars: usage_context.effective_prompt.chars().count()
+                            as i64,
                         status_code: 200,
                         latency_ms: started.elapsed().as_millis() as i64,
                         error_code: None,
@@ -1831,6 +2440,14 @@ impl AppService {
             .collect();
         if accounts.is_empty() {
             bail!("no available accounts");
+        }
+
+        if let Some(account_name) = normalize_optional_string(key.fixed_account_name.as_deref()) {
+            let Some(account) = accounts.into_iter().find(|account| account.name == account_name)
+            else {
+                bail!("configured fixed account is not available");
+            };
+            return Ok(vec![account]);
         }
 
         let Some(group_id) = key.account_group_id.as_deref() else {
@@ -2075,7 +2692,210 @@ fn text_message_content(text: &str) -> Value {
     })
 }
 
-fn image_prompt_message_content(mode: &str, prompt: &str, model: &str, n: usize) -> Value {
+fn build_session_aware_image_prompt(
+    detail: &SessionDetail,
+    prompt: &str,
+    requested_n: usize,
+    size: &str,
+) -> ImagePromptContext {
+    let text_items = prior_text_context(detail, 8);
+    let image_items = prior_image_context(detail, 4);
+    let size_credit_units = image_size_credit_units(size);
+    let context_text_count = text_items.len() as i64;
+    let context_image_count = image_items.len() as i64;
+    let context_credit_surcharge =
+        session_context_credit_surcharge(context_text_count, context_image_count);
+    let billable_credits = requested_n as i64 * size_credit_units + context_credit_surcharge;
+    let effective_prompt = render_image_mode_prompt(&text_items, &image_items, prompt, size);
+
+    ImagePromptContext {
+        effective_prompt,
+        billable_credits,
+        size: size.to_string(),
+        size_credit_units,
+        context_text_count,
+        context_image_count,
+        context_credit_surcharge,
+    }
+}
+
+fn render_image_mode_prompt(
+    text_items: &[String],
+    image_items: &[String],
+    prompt: &str,
+    size: &str,
+) -> String {
+    let mut effective_prompt = String::from(
+        "Image generation mode: create the image now. Do not ask follow-up questions. Do not answer with text, markdown, JSON, or options. If details are missing, make reasonable visual choices and generate a finished image.\n\n",
+    );
+    if !text_items.is_empty() {
+        effective_prompt.push_str("Prior text context:\n");
+        for item in text_items {
+            effective_prompt.push_str("- ");
+            effective_prompt.push_str(item);
+            effective_prompt.push('\n');
+        }
+        effective_prompt.push('\n');
+    }
+    if !image_items.is_empty() {
+        effective_prompt.push_str("Prior generated image context:\n");
+        for item in image_items {
+            effective_prompt.push_str("- ");
+            effective_prompt.push_str(item);
+            effective_prompt.push('\n');
+        }
+        effective_prompt.push('\n');
+    }
+    effective_prompt.push_str("Requested image size: ");
+    effective_prompt.push_str(size);
+    effective_prompt.push_str(
+        ". Match this aspect ratio and output size as closely as the image model allows.\n\n",
+    );
+    effective_prompt.push_str("Current request:\n");
+    effective_prompt.push_str(prompt);
+    effective_prompt
+}
+
+fn prior_text_context(detail: &SessionDetail, limit: usize) -> Vec<String> {
+    let mut items = Vec::new();
+    for message in detail.messages.iter().rev() {
+        if message.status != MessageStatus::Done {
+            continue;
+        }
+        for text in message_text_blocks(&message.content_json).into_iter().rev() {
+            let text = compact_context_text(&text, 600);
+            if text.is_empty() {
+                continue;
+            }
+            items.push(format!("{}: {}", message.role, text));
+            if items.len() >= limit {
+                items.reverse();
+                return items;
+            }
+        }
+    }
+    items.reverse();
+    items
+}
+
+fn prior_image_context(detail: &SessionDetail, limit: usize) -> Vec<String> {
+    let task_prompts = detail
+        .tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.prompt.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut artifacts = detail.artifacts.clone();
+    artifacts.sort_by_key(|artifact| artifact.created_at);
+    artifacts
+        .into_iter()
+        .rev()
+        .map(|artifact| {
+            let mut parts = Vec::new();
+            if let Some(prompt) = task_prompts
+                .get(artifact.task_id.as_str())
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(format!("source prompt: {}", compact_context_text(prompt, 800)));
+            } else if let Some(revised_prompt) =
+                artifact.revised_prompt.as_deref().map(str::trim).filter(|value| !value.is_empty())
+            {
+                parts
+                    .push(format!("revised prompt: {}", compact_context_text(revised_prompt, 800)));
+            }
+            if let (Some(width), Some(height)) = (artifact.width, artifact.height) {
+                parts.push(format!("size: {}x{}", width, height));
+            }
+            parts.push(format!("artifact: {}", artifact.relative_path));
+            parts.join("; ")
+        })
+        .take(limit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn message_text_blocks(content_json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(content_json) else {
+        return vec![content_json.to_string()];
+    };
+    value
+        .get("blocks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn compact_context_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut compact = normalized.chars().take(max_chars).collect::<String>();
+    compact.push_str("...");
+    compact
+}
+
+fn session_context_credit_surcharge(text_count: i64, image_count: i64) -> i64 {
+    let text_credit = i64::from(text_count > 0);
+    let image_credit = image_count.min(3);
+    (text_credit + image_credit).min(4)
+}
+
+fn normalize_image_size(size: &str) -> Result<String> {
+    let normalized = size.trim().to_ascii_lowercase();
+    let size = normalized.as_str();
+    let size = if size.is_empty() || size.eq_ignore_ascii_case("auto") {
+        DEFAULT_IMAGE_SIZE
+    } else {
+        size
+    };
+    let (width, height) = parse_image_dimensions(size)?;
+    Ok(format!("{width}x{height}"))
+}
+
+fn image_size_credit_units(size: &str) -> i64 {
+    parse_image_dimensions(size)
+        .map(|(width, height)| {
+            let area = u64::from(width) * u64::from(height);
+            area.div_ceil(BASE_IMAGE_CREDIT_AREA).max(1) as i64
+        })
+        .unwrap_or(1)
+}
+
+fn parse_image_dimensions(size: &str) -> Result<(u32, u32)> {
+    let (width, height) = size
+        .split_once('x')
+        .ok_or_else(|| anyhow!("size must use WIDTHxHEIGHT format, for example 1024x1024"))?;
+    let width = parse_image_dimension(width, "width")?;
+    let height = parse_image_dimension(height, "height")?;
+    Ok((width, height))
+}
+
+fn parse_image_dimension(value: &str, label: &str) -> Result<u32> {
+    let dimension = value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("image {label} must be a positive integer"))?;
+    if !(MIN_IMAGE_DIMENSION..=MAX_IMAGE_DIMENSION).contains(&dimension) {
+        bail!(
+            "image {label} must be between {MIN_IMAGE_DIMENSION} and {MAX_IMAGE_DIMENSION} pixels"
+        );
+    }
+    Ok(dimension)
+}
+
+fn image_prompt_message_content(
+    mode: &str,
+    prompt: &str,
+    model: &str,
+    n: usize,
+    size: &str,
+) -> Value {
     json!({
         "blocks": [{
             "type": "text",
@@ -2084,6 +2904,7 @@ fn image_prompt_message_content(mode: &str, prompt: &str, model: &str, n: usize)
         "kind": if mode == "edit" { "image_edit" } else { "image_generation" },
         "model": model,
         "n": n,
+        "size": size,
     })
 }
 
@@ -2093,12 +2914,24 @@ fn image_task_request_json(
     model: &str,
     n: usize,
     edit_input: Option<&ImageEditInput>,
+    image_context: &ImagePromptContext,
+    request_context: &RequestLogContext,
 ) -> Value {
     let mut payload = json!({
         "mode": mode,
         "prompt": prompt,
+        "effective_prompt": &image_context.effective_prompt,
         "model": model,
         "n": n,
+        "size": image_context.size,
+        "billing": {
+            "billable_credits": image_context.billable_credits,
+            "size_credit_units": image_context.size_credit_units,
+            "context_text_count": image_context.context_text_count,
+            "context_image_count": image_context.context_image_count,
+            "context_credit_surcharge": image_context.context_credit_surcharge,
+        },
+        "request": request_context,
     });
     if let Some(edit_input) = edit_input {
         payload["image"] = json!({
@@ -2126,6 +2959,86 @@ fn edit_input_for_task(task: &ImageTaskRecord) -> Result<ImageEditInput> {
     let mime_type =
         image.get("mime_type").and_then(Value::as_str).unwrap_or("image/png").to_string();
     Ok(ImageEditInput { image_data, file_name, mime_type })
+}
+
+fn usage_context_for_image_task(task: &ImageTaskRecord, endpoint: &str) -> UsageEventContext {
+    let payload = serde_json::from_str::<Value>(&task.request_json).unwrap_or(Value::Null);
+    let billing = payload.get("billing").and_then(Value::as_object);
+    let request = payload
+        .get("request")
+        .and_then(|value| serde_json::from_value::<RequestLogContext>(value.clone()).ok())
+        .unwrap_or_else(|| RequestLogContext::internal(endpoint));
+    let effective_prompt =
+        payload.get("effective_prompt").and_then(Value::as_str).unwrap_or(&task.prompt).to_string();
+    let image_size = payload
+        .get("size")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| Some(DEFAULT_IMAGE_SIZE.to_string()));
+    let size_credit_units = billing
+        .and_then(|value| value.get("size_credit_units"))
+        .and_then(Value::as_i64)
+        .or_else(|| image_size.as_deref().map(image_size_credit_units))
+        .unwrap_or(1);
+    let billable_credits = billing
+        .and_then(|value| value.get("billable_credits"))
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| task.n.max(1) * size_credit_units);
+    let context_text_count = billing
+        .and_then(|value| value.get("context_text_count"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let context_image_count = billing
+        .and_then(|value| value.get("context_image_count"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let context_credit_surcharge = billing
+        .and_then(|value| value.get("context_credit_surcharge"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    UsageEventContext {
+        request,
+        endpoint: endpoint.to_string(),
+        session_id: Some(task.session_id.clone()),
+        task_id: Some(task.id.clone()),
+        mode: task.mode.clone(),
+        image_size,
+        size_credit_units,
+        billable_credits,
+        context_text_count,
+        context_image_count,
+        context_credit_surcharge,
+        raw_prompt: task.prompt.clone(),
+        effective_prompt,
+    }
+}
+
+fn direct_usage_context(endpoint: &str, mode: &str, prompt: &str) -> UsageEventContext {
+    let is_image_mode = matches!(mode, "generation" | "edit");
+    UsageEventContext {
+        request: RequestLogContext::internal(endpoint),
+        endpoint: endpoint.to_string(),
+        session_id: None,
+        task_id: None,
+        mode: mode.to_string(),
+        image_size: is_image_mode.then(|| DEFAULT_IMAGE_SIZE.to_string()),
+        size_credit_units: i64::from(is_image_mode),
+        billable_credits: 1,
+        context_text_count: 0,
+        context_image_count: 0,
+        context_credit_surcharge: 0,
+        raw_prompt: prompt.to_string(),
+        effective_prompt: prompt.to_string(),
+    }
+}
+
+fn prompt_preview(prompt: &str) -> Option<String> {
+    let preview = compact_context_text(prompt, 240);
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview)
+    }
 }
 
 fn should_refresh_access_token(account: &AccountRecord) -> bool {
@@ -2278,7 +3191,10 @@ mod tests {
     use super::*;
     use crate::{
         config::ResolvedPaths,
-        models::{AccountProxyMode, AccountRecord, BrowserProfile, ProxyConfigRecord},
+        models::{
+            AccountProxyMode, AccountRecord, BrowserProfile, ImageArtifactRecord, ImageTaskStatus,
+            ProxyConfigRecord,
+        },
         storage::Storage,
     };
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -2334,6 +3250,103 @@ mod tests {
             sec_ch_ua_platform: None,
         })
         .expect("browser profile json")
+    }
+
+    #[test]
+    fn image_size_credit_units_use_area_formula() {
+        assert_eq!(normalize_image_size("auto").expect("auto size"), DEFAULT_IMAGE_SIZE);
+        assert_eq!(normalize_image_size("1536X1024").expect("custom size"), "1536x1024");
+        assert_eq!(image_size_credit_units("1024x1024"), 1);
+        assert_eq!(image_size_credit_units("1024x1536"), 2);
+        assert_eq!(image_size_credit_units("1536x1024"), 2);
+        assert_eq!(image_size_credit_units("2048x2048"), 4);
+        assert!(normalize_image_size("128x1024").is_err());
+        assert!(normalize_image_size("4097x1024").is_err());
+    }
+
+    #[test]
+    fn session_image_context_ignores_failed_assistant_text() {
+        let detail = SessionDetail {
+            session: SessionRecord {
+                id: "sess".to_string(),
+                key_id: "key".to_string(),
+                title: "title".to_string(),
+                source: SessionSource::Web,
+                status: "active".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                last_message_at: Some(1),
+            },
+            messages: vec![
+                MessageRecord {
+                    id: "user".to_string(),
+                    session_id: "sess".to_string(),
+                    key_id: "key".to_string(),
+                    role: "user".to_string(),
+                    content_json: text_message_content("深圳 美女").to_string(),
+                    status: MessageStatus::Done,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                MessageRecord {
+                    id: "assistant".to_string(),
+                    session_id: "sess".to_string(),
+                    key_id: "key".to_string(),
+                    role: "assistant".to_string(),
+                    content_json: json!({
+                        "blocks": [{ "type": "error", "text": "duplicated upstream text" }]
+                    })
+                    .to_string(),
+                    status: MessageStatus::Failed,
+                    created_at: 2,
+                    updated_at: 2,
+                },
+            ],
+            tasks: vec![ImageTaskRecord {
+                id: "task".to_string(),
+                session_id: "sess".to_string(),
+                message_id: "assistant-done".to_string(),
+                key_id: "key".to_string(),
+                status: ImageTaskStatus::Succeeded,
+                mode: "generation".to_string(),
+                prompt: "写实风格".to_string(),
+                model: "gpt-image-2".to_string(),
+                n: 1,
+                request_json: "{}".to_string(),
+                phase: "done".to_string(),
+                queue_entered_at: 1,
+                started_at: Some(1),
+                finished_at: Some(2),
+                position_snapshot: Some(0),
+                estimated_start_after_ms: None,
+                error_code: None,
+                error_message: None,
+            }],
+            artifacts: vec![ImageArtifactRecord {
+                id: "artifact".to_string(),
+                task_id: "task".to_string(),
+                session_id: "sess".to_string(),
+                message_id: "assistant-done".to_string(),
+                key_id: "key".to_string(),
+                relative_path: "artifacts/image.png".to_string(),
+                mime_type: "image/png".to_string(),
+                sha256: "hash".to_string(),
+                size_bytes: 1,
+                width: Some(1024),
+                height: Some(1024),
+                revised_prompt: Some(
+                    "Continue this image-generation session. Prior text context: duplicated upstream text"
+                        .to_string(),
+                ),
+                created_at: 3,
+            }],
+        };
+
+        let context = build_session_aware_image_prompt(&detail, "写实风格", 1, DEFAULT_IMAGE_SIZE);
+
+        assert!(context.effective_prompt.contains("user: 深圳 美女"));
+        assert!(context.effective_prompt.contains("source prompt: 写实风格"));
+        assert!(!context.effective_prompt.contains("duplicated upstream text"));
     }
 
     #[tokio::test]

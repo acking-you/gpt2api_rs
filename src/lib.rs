@@ -1,6 +1,7 @@
 //! Standalone ChatGPT image gateway.
 
 pub mod accounts;
+pub mod activity;
 pub mod admin_client;
 pub mod app;
 pub mod cli;

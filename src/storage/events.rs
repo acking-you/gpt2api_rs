@@ -17,6 +17,8 @@ pub struct UsageEventQuery {
     pub q: Option<String>,
     /// Whether management-plane requests should be included.
     pub include_admin: bool,
+    /// Whether only credit-consuming rows should match.
+    pub billable_only: bool,
     /// Page limit.
     pub limit: u64,
     /// Page offset.
@@ -109,6 +111,11 @@ impl EventStore {
             } else {
                 "AND endpoint NOT LIKE '/admin/%'"
             };
+            let billable_filter_sql = if query.billable_only {
+                "AND COALESCE(billable_credits, billable_images, 0) > 0"
+            } else {
+                ""
+            };
             let where_sql = format!(
                 r#"
                 (?1 IS NULL OR key_id = ?1)
@@ -126,6 +133,7 @@ impl EventStore {
                     ) LIKE ?2
                 )
                 {admin_filter_sql}
+                {billable_filter_sql}
             "#
             );
             let total: i64 = conn.query_row(

@@ -3,18 +3,17 @@
 ## Scope
 
 `gpt2api-rs` is a standalone Rust service for managing imported ChatGPT web
-access tokens and exposing a small image-gateway-compatible control plane. The
-current codebase intentionally stops at bootstrap capabilities:
+accounts and exposing public GPT2API image-generation endpoints plus an admin
+control plane. Current runtime capabilities include:
 
 - local storage bootstrap
 - account import parsing helpers
 - account refresh helpers against ChatGPT web endpoints
-- routing and scheduler primitives
-- public bootstrap endpoints
-- admin list/status endpoints
+- routing, account groups, and proxy configuration
+- public key login, session, task, artifact, and OpenAI-compatible image
+  endpoints
+- admin account, key, usage, queue, proxy, and group endpoints
 - local admin CLI REST client
-
-The actual image-generation POST flow is the next implementation slice.
 
 ## Repository layout
 
@@ -76,14 +75,51 @@ it.
 ### Public
 
 - `GET /healthz`
+- `GET /version`
+- `GET|POST /auth/login`
+- `POST /auth/verify`
+- `GET /me`
+- `GET /me/usage/events`
+- `PATCH /me/notification`
+- `GET|POST /sessions`
+- `GET|PATCH|DELETE /sessions/:session_id`
+- `GET /sessions/:session_id/events`
+- `POST /sessions/:session_id/messages`
+- `POST /sessions/:session_id/messages/edit`
+- `GET /tasks/:task_id`
+- `POST /tasks/:task_id/cancel`
+- `GET /artifacts/:artifact_id`
+- `GET /share/:token`
+- `GET /share/:token/artifacts/:artifact_id`
 - `GET /v1/models`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
 
 ### Admin
 
+- `GET /admin/sessions`
+- `GET /admin/queue`
+- `PATCH /admin/queue/config`
+- `POST /admin/tasks/:task_id/cancel`
 - `GET /admin/status`
 - `GET /admin/accounts`
+- `DELETE /admin/accounts`
+- `POST /admin/accounts/import`
+- `POST /admin/accounts/refresh`
+- `POST /admin/accounts/update`
+- `GET|POST /admin/proxy-configs`
+- `GET|PATCH|DELETE /admin/proxy-configs/:proxy_id`
+- `POST /admin/proxy-configs/:proxy_id/check`
+- `GET|POST /admin/account-groups`
+- `PATCH|DELETE /admin/account-groups/:group_id`
 - `GET /admin/keys`
+- `POST /admin/keys`
+- `PATCH|DELETE /admin/keys/:key_id`
+- `POST /admin/keys/:key_id/rotate`
 - `GET /admin/usage`
+- `GET /admin/usage/events`
 
 All admin endpoints require `Authorization: Bearer <admin-token>`.
 
@@ -111,7 +147,5 @@ Integration tests currently cover:
 
 ## Known gaps
 
-- image-generation POST handlers are not implemented yet
-- admin write operations such as account import/delete are not exposed yet
-- periodic background refresh is scaffolded but not wired into runtime startup
-- usage flushing from SQLite outbox into DuckDB is not wired into a live worker
+- This document is an implementation overview. User-facing request examples live
+  in `skills/gpt2api-image-request/SKILL.md`.

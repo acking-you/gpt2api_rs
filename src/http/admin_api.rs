@@ -687,6 +687,7 @@ pub async fn list_usage_events(
             key_id,
             q,
             include_admin: query.include_admin,
+            billable_only: false,
             limit: query.limit.unwrap_or(50),
             offset: query.offset.unwrap_or(0),
         })

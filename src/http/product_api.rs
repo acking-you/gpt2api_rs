@@ -163,6 +163,7 @@ pub async fn get_my_usage_events(
             key_id: Some(key.id.clone()),
             q: query.q,
             include_admin: false,
+            billable_only: true,
             limit: query.limit.unwrap_or(50),
             offset: query.offset.unwrap_or(0),
         })

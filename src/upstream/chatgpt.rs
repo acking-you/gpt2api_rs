@@ -1126,6 +1126,26 @@ pub fn is_token_invalid_error(message: &str) -> bool {
         || text.contains("/backend-api/me failed: http 401")
 }
 
+/// Returns whether an upstream failure happened while transporting an otherwise accepted request.
+#[must_use]
+pub fn is_transient_upstream_transport_error(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("conversation body read failed")
+        || text.contains("edit conversation body read failed")
+        || text.contains("text conversation body read failed")
+        || text.contains("conversation request failed")
+        || text.contains("edit conversation request failed")
+        || text.contains("text conversation request failed")
+        || text.contains("conversation poll request failed")
+        || text.contains("conversation poll body read failed")
+        || text.contains("download image body read failed")
+        || text.contains("connection reset")
+        || text.contains("connection closed")
+        || text.contains("unexpected eof")
+        || text.contains("timed out")
+        || text.contains("timeout")
+}
+
 /// Returns the JWT expiry timestamp embedded in one ChatGPT access token.
 #[must_use]
 pub(crate) fn access_token_expires_at(access_token: &str) -> Option<i64> {

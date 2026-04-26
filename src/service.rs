@@ -32,9 +32,9 @@ use crate::{
     scheduler::{Lease, LocalRequestScheduler},
     storage::{control::CreateImageTaskInput, Storage},
     upstream::chatgpt::{
-        access_token_expires_at, is_token_invalid_error, ChatgptImageResult,
-        ChatgptImageTextResponse, ChatgptTextResult, ChatgptTextStream, ChatgptUpstreamClient,
-        GeneratedImageItem,
+        access_token_expires_at, is_token_invalid_error, is_transient_upstream_transport_error,
+        ChatgptImageResult, ChatgptImageTextResponse, ChatgptTextResult, ChatgptTextStream,
+        ChatgptUpstreamClient, GeneratedImageItem,
     },
 };
 
@@ -1845,7 +1845,7 @@ impl AppService {
                     self.finish_image_task_with_assistant_text(&task, text_response).await?;
                     return Ok(());
                 }
-                let error_message = error.to_string();
+                let error_message = public_image_task_error_message(&error);
                 let _ = self
                     .storage
                     .control
@@ -2079,8 +2079,12 @@ impl AppService {
         let mut selected_account_name = String::new();
         let mut last_error = None;
         let mut text_response = None;
+        let max_attempts =
+            self.storage.control.list_accounts().await?.len().max(1).saturating_mul(requested_n);
+        let mut attempts = 0_usize;
 
-        for _ in 0..requested_n {
+        while images.len() < requested_n && attempts < max_attempts {
+            attempts += 1;
             let (account, lease) = self.acquire_account_for_key(key).await?;
             let _keep_account_lease = lease;
             let account = self.refresh_account_if_needed(account).await?;
@@ -2105,7 +2109,8 @@ impl AppService {
             match result {
                 Ok(result) => {
                     resolved_model = result.resolved_model.clone();
-                    images.extend(result.data);
+                    let remaining = requested_n.saturating_sub(images.len());
+                    images.extend(result.data.into_iter().take(remaining));
                     self.record_account_success(&account).await?;
                 }
                 Err(error) => {
@@ -2117,9 +2122,12 @@ impl AppService {
                     }
                     self.record_account_failure(&account, &error.to_string()).await?;
                     last_error = Some(error.to_string());
-                    if is_token_invalid_error(&error.to_string()) {
+                    if is_token_invalid_error(&error.to_string())
+                        || is_transient_upstream_transport_error(&error.to_string())
+                    {
                         continue;
                     }
+                    break;
                 }
             }
         }
@@ -3039,6 +3047,14 @@ fn prompt_preview(prompt: &str) -> Option<String> {
     } else {
         Some(preview)
     }
+}
+
+fn public_image_task_error_message(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    if is_transient_upstream_transport_error(&message) {
+        return "Image response stream was interrupted before completion. The task was retried but did not finish; please send again.".to_string();
+    }
+    message
 }
 
 fn should_refresh_access_token(account: &AccountRecord) -> bool {

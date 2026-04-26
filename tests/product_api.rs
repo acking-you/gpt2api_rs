@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use gpt2api_rs::{
     app::build_router,
     config::ResolvedPaths,
-    models::{ApiKeyRecord, ApiKeyRole},
+    models::{ApiKeyRecord, ApiKeyRole, UsageEventRecord},
     service::AppService,
     storage::Storage,
     upstream::chatgpt::{ChatgptUpstreamClient, GeneratedImageItem},
@@ -176,6 +176,31 @@ async fn image_message_creates_pending_assistant_message_and_queued_task() {
 }
 
 #[tokio::test]
+async fn my_usage_events_only_returns_credit_consuming_rows() {
+    let (_temp, app, storage) = build_app().await;
+    storage
+        .events
+        .insert_usage_events(&[
+            usage_event("zero-call", "user-a", 0, "/sessions"),
+            usage_event("charged-image", "user-a", 3, "/v1/images/generations"),
+            usage_event("other-key", "user-b", 5, "/v1/images/generations"),
+        ])
+        .await
+        .expect("usage events inserted");
+
+    let (status, value) =
+        json_request(app, "GET", "/me/usage/events?limit=20", "sk-user-a", json!({})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["total"], 1);
+    assert_eq!(value["billable_credit_total"], 3);
+    let events = value["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event_id"], "charged-image");
+    assert_eq!(events[0]["billable_credits"], 3);
+}
+
+#[tokio::test]
 async fn session_delete_removes_conversation_tasks_artifacts_and_records_api_event() {
     let (_temp, app, storage) = build_app().await;
     let (_status, created) =
@@ -289,6 +314,51 @@ async fn session_delete_removes_conversation_tasks_artifacts_and_records_api_eve
             && row.payload.status_code == 200
             && row.payload.billable_credits == 0
     }));
+}
+
+fn usage_event(
+    event_id: &str,
+    key_id: &str,
+    billable_credits: i64,
+    endpoint: &str,
+) -> UsageEventRecord {
+    UsageEventRecord {
+        event_id: event_id.to_string(),
+        request_id: format!("req-{event_id}"),
+        key_id: key_id.to_string(),
+        key_name: key_id.to_string(),
+        account_name: "account-a".to_string(),
+        endpoint: endpoint.to_string(),
+        request_method: "POST".to_string(),
+        request_url: endpoint.to_string(),
+        requested_model: "gpt-image-2".to_string(),
+        resolved_upstream_model: "gpt-image-2".to_string(),
+        session_id: None,
+        task_id: None,
+        mode: "generation".to_string(),
+        image_size: Some("1024x1024".to_string()),
+        requested_n: 1,
+        generated_n: i64::from(billable_credits > 0),
+        billable_images: i64::from(billable_credits > 0),
+        billable_credits,
+        size_credit_units: 1,
+        context_text_count: 0,
+        context_image_count: 0,
+        context_credit_surcharge: 0,
+        client_ip: "127.0.0.1".to_string(),
+        request_headers_json: None,
+        prompt_preview: Some("draw".to_string()),
+        last_message_content: Some("draw".to_string()),
+        request_body_json: None,
+        prompt_chars: 4,
+        effective_prompt_chars: 4,
+        status_code: 200,
+        latency_ms: 10,
+        error_code: None,
+        error_message: None,
+        detail_ref: None,
+        created_at: 100,
+    }
 }
 
 #[tokio::test]

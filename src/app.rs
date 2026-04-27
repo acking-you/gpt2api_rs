@@ -47,8 +47,13 @@ pub fn build_router(service: Arc<AppService>) -> Router {
         .route("/sessions/:session_id/messages/edit", post(product_api::create_edit_message))
         .route("/tasks/:task_id", get(product_api::get_task))
         .route("/tasks/:task_id/cancel", post(product_api::cancel_task))
+        .route("/artifacts/:artifact_id/thumbnail", get(product_api::get_artifact_thumbnail))
         .route("/artifacts/:artifact_id", get(product_api::get_artifact))
         .route("/share/:token", get(product_api::get_share))
+        .route(
+            "/share/:token/artifacts/:artifact_id/thumbnail",
+            get(product_api::get_shared_artifact_thumbnail),
+        )
         .route("/share/:token/artifacts/:artifact_id", get(product_api::get_shared_artifact))
         .route("/v1/models", get(public_api::list_models))
         .route("/v1/images/generations", post(public_api::generate_images))

@@ -27,6 +27,7 @@ impl Storage {
         tokio::fs::create_dir_all(&paths.root).await?;
         tokio::fs::create_dir_all(&paths.event_blobs_dir).await?;
         tokio::fs::create_dir_all(&paths.image_artifacts_dir).await?;
+        tokio::fs::create_dir_all(paths.root.join("artifacts").join("thumbnails")).await?;
 
         let control = control::ControlDb::open(paths.control_db.clone()).await?;
         let events = events::EventStore::open(paths.events_duckdb.clone()).await?;

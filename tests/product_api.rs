@@ -13,9 +13,13 @@ use gpt2api_rs::{
     storage::Storage,
     upstream::chatgpt::{ChatgptUpstreamClient, GeneratedImageItem},
 };
+use image::{codecs::png::PngEncoder, ImageEncoder};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
 
@@ -90,6 +94,28 @@ async fn json_request(
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.expect("body");
     let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
     (status, value)
+}
+
+async fn binary_request(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response =
+        app.oneshot(request.body(Body::empty()).expect("request")).await.expect("response");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.expect("body").to_vec();
+    (status, content_type, bytes)
 }
 
 #[tokio::test]
@@ -314,6 +340,103 @@ async fn session_delete_removes_conversation_tasks_artifacts_and_records_api_eve
             && row.payload.status_code == 200
             && row.payload.billable_credits == 0
     }));
+}
+
+#[tokio::test]
+async fn artifact_thumbnail_endpoint_serves_generated_thumbnail_without_original_bytes() {
+    let (_temp, app, storage) = build_app().await;
+    let (_status, created) =
+        json_request(app.clone(), "POST", "/sessions", "sk-user-a", json!({"title":"Preview"}))
+            .await;
+    let session_id = created["session"]["id"].as_str().expect("session id");
+    let (_status, submitted) = json_request(
+        app.clone(),
+        "POST",
+        &format!("/sessions/{session_id}/messages"),
+        "sk-user-a",
+        json!({"kind":"image_generation","prompt":"draw a lake","model":"gpt-image-2","n":1}),
+    )
+    .await;
+    let task_id = submitted["task"]["id"].as_str().expect("task id");
+    let assistant_message_id =
+        submitted["assistant_message"]["id"].as_str().expect("assistant message id");
+    let original = valid_test_png();
+    let artifact = storage
+        .artifacts
+        .write_generated_image(
+            task_id,
+            session_id,
+            assistant_message_id,
+            "user-a",
+            &GeneratedImageItem {
+                b64_json: BASE64.encode(&original),
+                revised_prompt: "lake".to_string(),
+            },
+            0,
+        )
+        .await
+        .expect("artifact file written");
+    storage.control.insert_image_artifact(&artifact).await.expect("artifact row");
+    let signed_link = storage
+        .control
+        .create_signed_link("image_task", task_id, unix_timestamp_secs(), 3600)
+        .await
+        .expect("signed link");
+    assert!(storage
+        .control
+        .resolve_signed_link(&signed_link.plaintext_token, unix_timestamp_secs())
+        .await
+        .expect("signed link resolves")
+        .is_some());
+
+    let (status, content_type, bytes) = binary_request(
+        app.clone(),
+        "GET",
+        &format!("/artifacts/{}/thumbnail", artifact.id),
+        Some("sk-user-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("image/jpeg"));
+    assert!(!bytes.is_empty());
+    assert_ne!(bytes, original);
+
+    let (other_status, _other_content_type, _other_bytes) = binary_request(
+        app.clone(),
+        "GET",
+        &format!("/artifacts/{}/thumbnail", artifact.id),
+        Some("sk-user-b"),
+    )
+    .await;
+    assert_eq!(other_status, StatusCode::NOT_FOUND);
+
+    let (share_status, share_content_type, share_bytes) = binary_request(
+        app,
+        "GET",
+        &format!("/share/{}/artifacts/{}/thumbnail", signed_link.plaintext_token, artifact.id),
+        None,
+    )
+    .await;
+    assert_eq!(share_status, StatusCode::OK, "{}", String::from_utf8_lossy(&share_bytes));
+    assert_eq!(share_content_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(share_bytes, bytes);
+}
+
+fn valid_test_png() -> Vec<u8> {
+    let pixels = [
+        0x10, 0x70, 0xc0, 0xff, 0x20, 0x80, 0xd0, 0xff, 0x30, 0x90, 0xe0, 0xff, 0x40, 0xa0, 0xf0,
+        0xff,
+    ];
+    let mut bytes = Vec::new();
+    PngEncoder::new(&mut bytes)
+        .write_image(&pixels, 2, 2, image::ColorType::Rgba8.into())
+        .expect("encode test png");
+    bytes
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_secs()
+        as i64
 }
 
 fn usage_event(

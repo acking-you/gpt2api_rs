@@ -15,6 +15,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 duckdb = { version = "1", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 parking_lot = "0.12"
 primp = "1.2"

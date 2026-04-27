@@ -558,6 +558,45 @@ pub async fn get_shared_artifact(
         .map_err(AppError::internal)
 }
 
+/// Streams one cached thumbnail belonging to a signed image-task share.
+pub async fn get_shared_artifact_thumbnail(
+    Path((token, artifact_id)): Path<(String, String)>,
+    State(service): State<Arc<AppService>>,
+) -> Result<Response, AppError> {
+    let link = service
+        .storage()
+        .control
+        .resolve_signed_link(&token, unix_timestamp_secs())
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("share link not found"))?;
+    if link.scope != "image_task" {
+        return Err(AppError::not_found("share link not found"));
+    }
+    let task = service
+        .storage()
+        .control
+        .get_image_task(&link.scope_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("task not found"))?;
+    let artifact = service
+        .storage()
+        .control
+        .get_image_artifact(&artifact_id)
+        .await
+        .map_err(AppError::internal)?
+        .filter(|artifact| artifact.task_id == task.id)
+        .ok_or_else(|| AppError::not_found("artifact not found"))?;
+    let bytes = service
+        .storage()
+        .artifacts
+        .read_or_create_thumbnail(&artifact)
+        .await
+        .map_err(AppError::internal)?;
+    thumbnail_response(bytes)
+}
+
 /// Returns one task visible to the current product key.
 pub async fn get_task(
     Path(task_id): Path<String>,
@@ -620,6 +659,30 @@ pub async fn get_artifact(
         .header(axum::http::header::CONTENT_TYPE, artifact.mime_type)
         .body(Body::from(bytes))
         .map_err(AppError::internal)
+}
+
+/// Streams one cached thumbnail visible to the current product key.
+pub async fn get_artifact_thumbnail(
+    Path(artifact_id): Path<String>,
+    State(service): State<Arc<AppService>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let key = authenticate_product_key(&service, &headers).await?;
+    let artifact = service
+        .storage()
+        .control
+        .get_image_artifact(&artifact_id)
+        .await
+        .map_err(AppError::internal)?
+        .filter(|artifact| artifact.key_id == key.id || service.is_product_admin(&key))
+        .ok_or_else(|| AppError::not_found("artifact not found"))?;
+    let bytes = service
+        .storage()
+        .artifacts
+        .read_or_create_thumbnail(&artifact)
+        .await
+        .map_err(AppError::internal)?;
+    thumbnail_response(bytes)
 }
 
 /// Returns the product-admin queue snapshot.
@@ -719,6 +782,15 @@ fn ensure_product_admin(service: &Arc<AppService>, key: &ApiKeyRecord) -> Result
     } else {
         Err(AppError::with_status(StatusCode::FORBIDDEN, "admin role required"))
     }
+}
+
+fn thumbnail_response(bytes: Vec<u8>) -> Result<Response, AppError> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "image/jpeg")
+        .header(axum::http::header::CACHE_CONTROL, "private, max-age=31536000, immutable")
+        .body(Body::from(bytes))
+        .map_err(AppError::internal)
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {

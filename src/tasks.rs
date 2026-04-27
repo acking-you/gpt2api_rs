@@ -44,6 +44,12 @@ impl ImageTaskRunner {
     pub async fn drain_once(&self) -> Result<()> {
         loop {
             let config = self.service.storage().control.get_runtime_config().await?;
+            self.service
+                .recover_timed_out_image_tasks(
+                    config.image_task_timeout_seconds,
+                    unix_timestamp_secs(),
+                )
+                .await?;
             let Some(task) = self
                 .service
                 .storage()

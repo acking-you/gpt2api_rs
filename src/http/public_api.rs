@@ -104,7 +104,7 @@ pub async fn generate_images(
     let key = authenticate_key(&service, &headers).await?;
     let n = validate_image_count(body.n)?;
     let session = service
-        .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+        .resolve_direct_image_api_session(&key, extract_session_header(&headers).as_deref())
         .await
         .map_err(map_public_request_error)?;
     let submission = service
@@ -196,7 +196,7 @@ pub async fn edit_images(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::bad_request("image file is required"))?;
     let session = service
-        .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+        .resolve_direct_image_api_session(&key, extract_session_header(&headers).as_deref())
         .await
         .map_err(map_public_request_error)?;
     let submission = service
@@ -245,7 +245,7 @@ pub async fn create_chat_completion(
         let n = validate_image_count(body.get("n").and_then(Value::as_u64).unwrap_or(1) as usize)?;
         let size = body.get("size").and_then(Value::as_str).unwrap_or("1024x1024");
         let session = service
-            .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+            .resolve_direct_image_api_session(&key, extract_session_header(&headers).as_deref())
             .await
             .map_err(map_public_request_error)?;
         let submission = match extract_chat_image(&body)? {
@@ -392,7 +392,7 @@ pub async fn create_response(
     if has_response_image_generation_tool(&body) {
         let size = body.get("size").and_then(Value::as_str).unwrap_or("1024x1024");
         let session = service
-            .resolve_api_session(&key, extract_session_header(&headers).as_deref())
+            .resolve_direct_image_api_session(&key, extract_session_header(&headers).as_deref())
             .await
             .map_err(map_public_request_error)?;
         let submission = match extract_response_image(body.get("input"))? {

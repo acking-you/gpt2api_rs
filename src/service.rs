@@ -20,9 +20,10 @@ use crate::{
     activity::{RequestActivityGuard, RequestActivitySnapshot, RequestActivityTracker},
     config::SmtpConfig,
     models::{
-        AccountGroupRecord, AccountMetadata, AccountRecord, ApiKeyRecord, ApiKeyRole,
-        BrowserProfile, ImageSubmissionResult, ImageTaskRecord, MessageRecord, MessageStatus,
-        ProxyConfigRecord, SessionDetail, SessionRecord, SessionSource, UsageEventRecord,
+        effective_image_task_timeout_seconds, AccountGroupRecord, AccountMetadata, AccountRecord,
+        ApiKeyRecord, ApiKeyRole, BrowserProfile, ImageSubmissionResult, ImageTaskRecord,
+        MessageRecord, MessageStatus, ProxyConfigRecord, SessionDetail, SessionRecord,
+        SessionSource, UsageEventRecord,
     },
     notifications::{
         is_valid_notification_email, render_image_done_email, send_rendered_email,
@@ -544,6 +545,30 @@ impl AppService {
         self.storage.control.create_session(&key.id, "API Requests", SessionSource::Api).await
     }
 
+    /// Resolves an explicit API session header or creates a one-shot image session.
+    ///
+    /// OpenAI-compatible image endpoints are direct request/response APIs. Without an explicit
+    /// session header, each image request must be isolated so prior generated images or prompts are
+    /// not folded into the next task's prompt context.
+    pub async fn resolve_direct_image_api_session(
+        &self,
+        key: &ApiKeyRecord,
+        supplied_session_id: Option<&str>,
+    ) -> Result<SessionRecord> {
+        if let Some(session_id) =
+            supplied_session_id.map(str::trim).filter(|value| !value.is_empty())
+        {
+            return self
+                .storage
+                .control
+                .get_session_for_key(session_id, &key.id)
+                .await?
+                .ok_or_else(|| anyhow!("x-gpt2api-session-id does not belong to this key"));
+        }
+
+        self.storage.control.create_session(&key.id, "API Image Request", SessionSource::Api).await
+    }
+
     /// Fetches a key-scoped session detail.
     pub async fn get_session_detail_for_key(
         &self,
@@ -902,6 +927,11 @@ impl AppService {
             }
 
             let config = self.storage.control.get_runtime_config().await?;
+            self.recover_timed_out_image_tasks(
+                config.image_task_timeout_seconds,
+                unix_timestamp_secs(),
+            )
+            .await?;
             if let Some(claimed) = self
                 .storage
                 .control
@@ -1791,13 +1821,59 @@ impl AppService {
         Ok(tasks.len())
     }
 
+    /// Fails running image tasks that exceeded the configured runtime cap.
+    ///
+    /// The worker future owns upstream generation while it is alive, but a stale running row also
+    /// consumes a global queue slot. This recovery path keeps the database state authoritative for
+    /// stuck or orphaned running tasks.
+    pub async fn recover_timed_out_image_tasks(
+        &self,
+        timeout_seconds: i64,
+        now: i64,
+    ) -> Result<usize> {
+        let timeout_seconds = effective_image_task_timeout_seconds(timeout_seconds);
+        let cutoff_started_at = now.saturating_sub(timeout_seconds);
+        let tasks = self
+            .storage
+            .control
+            .list_running_image_tasks_started_at_or_before(cutoff_started_at)
+            .await?;
+        if tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let error_message =
+            format!("Image task timed out after {timeout_seconds} seconds. Please send again.");
+        for task in &tasks {
+            self.storage
+                .control
+                .mark_image_task_failed(&task.id, now, "image_task_timeout", &error_message)
+                .await?;
+            self.storage
+                .control
+                .update_message_content_status(
+                    &task.message_id,
+                    json!({
+                        "blocks": [{
+                            "type": "error",
+                            "text": error_message,
+                        }],
+                    }),
+                    MessageStatus::Failed,
+                )
+                .await?;
+        }
+
+        Ok(tasks.len())
+    }
+
     /// Executes a queue-claimed image task with a hard runtime cap.
     pub async fn execute_claimed_image_task_with_timeout(
         &self,
         task: ImageTaskRecord,
         timeout_seconds: i64,
     ) -> Result<()> {
-        let timeout_seconds = timeout_seconds.max(1) as u64;
+        let timeout_seconds = effective_image_task_timeout_seconds(timeout_seconds) as u64;
         match tokio::time::timeout(
             Duration::from_secs(timeout_seconds),
             self.execute_claimed_image_task(task.clone()),

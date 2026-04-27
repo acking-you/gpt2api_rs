@@ -515,12 +515,12 @@ async fn admin_key_can_update_global_queue_concurrency() {
         "PATCH",
         "/admin/queue/config",
         "sk-admin-a",
-        json!({"global_image_concurrency":2,"image_task_timeout_seconds":600}),
+        json!({"global_image_concurrency":2,"image_task_timeout_seconds":180}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["config"]["global_image_concurrency"], 2);
-    assert_eq!(value["config"]["image_task_timeout_seconds"], 600);
+    assert_eq!(value["config"]["image_task_timeout_seconds"], 180);
 
     let (user_status, _user_value) = json_request(
         app,
@@ -531,6 +531,22 @@ async fn admin_key_can_update_global_queue_concurrency() {
     )
     .await;
     assert_eq!(user_status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_queue_config_rejects_image_task_timeout_over_three_minutes() {
+    let (_temp, app, _storage) = build_app().await;
+    let (status, value) = json_request(
+        app,
+        "PATCH",
+        "/admin/queue/config",
+        "sk-admin-a",
+        json!({"image_task_timeout_seconds":181}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(value["error"].as_str().expect("error text").contains("between 60 and 180"));
 }
 
 #[tokio::test]

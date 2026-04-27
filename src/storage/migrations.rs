@@ -4,6 +4,11 @@ use anyhow::Result;
 use duckdb::Connection as DuckConnection;
 use rusqlite::Connection as SqliteConnection;
 
+use crate::models::{
+    DEFAULT_IMAGE_TASK_TIMEOUT_SECONDS, MAX_IMAGE_TASK_TIMEOUT_SECONDS,
+    MIN_IMAGE_TASK_TIMEOUT_SECONDS,
+};
+
 /// Creates all control-plane tables if they do not exist yet.
 pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
     conn.execute_batch(
@@ -84,7 +89,7 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
             global_image_concurrency INTEGER NOT NULL DEFAULT 1,
             signed_link_ttl_seconds INTEGER NOT NULL DEFAULT 604800,
             queue_eta_window_size INTEGER NOT NULL DEFAULT 20,
-            image_task_timeout_seconds INTEGER NOT NULL DEFAULT 900
+            image_task_timeout_seconds INTEGER NOT NULL DEFAULT 180
         );
 
         CREATE TABLE IF NOT EXISTS event_outbox (
@@ -98,6 +103,7 @@ pub fn bootstrap_control_schema(conn: &SqliteConnection) -> Result<()> {
     )?;
     ensure_runtime_config_product_columns(conn)?;
     ensure_runtime_config_row(conn)?;
+    normalize_runtime_config_product_values(conn)?;
     bootstrap_product_tables(conn)?;
     ensure_account_column(
         conn,
@@ -272,9 +278,9 @@ fn ensure_runtime_config_product_columns(conn: &SqliteConnection) -> Result<()> 
         )?;
     }
     if !columns.iter().any(|column| column == "image_task_timeout_seconds") {
-        conn.execute_batch(
-            "ALTER TABLE runtime_config ADD COLUMN image_task_timeout_seconds INTEGER NOT NULL DEFAULT 900",
-        )?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE runtime_config ADD COLUMN image_task_timeout_seconds INTEGER NOT NULL DEFAULT {DEFAULT_IMAGE_TASK_TIMEOUT_SECONDS}"
+        ))?;
     }
     Ok(())
 }
@@ -307,9 +313,21 @@ fn ensure_runtime_config_row(conn: &SqliteConnection) -> Result<()> {
             1,
             604800,
             20,
-            900
+            180
         );
         "#,
+    )?;
+    Ok(())
+}
+
+fn normalize_runtime_config_product_values(conn: &SqliteConnection) -> Result<()> {
+    conn.execute(
+        "UPDATE runtime_config SET image_task_timeout_seconds = ?1 WHERE image_task_timeout_seconds > ?1",
+        [MAX_IMAGE_TASK_TIMEOUT_SECONDS],
+    )?;
+    conn.execute(
+        "UPDATE runtime_config SET image_task_timeout_seconds = ?1 WHERE image_task_timeout_seconds < ?1",
+        [MIN_IMAGE_TASK_TIMEOUT_SECONDS],
     )?;
     Ok(())
 }

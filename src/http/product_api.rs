@@ -21,7 +21,10 @@ use serde_json::{json, Value};
 
 use crate::{
     error::AppError,
-    models::{ApiKeyRecord, ApiKeyRole, SessionDetail},
+    models::{
+        ApiKeyRecord, ApiKeyRole, SessionDetail, MAX_IMAGE_TASK_TIMEOUT_SECONDS,
+        MIN_IMAGE_TASK_TIMEOUT_SECONDS,
+    },
     service::{
         AppService, ImageEditInput, ImageEditSubmission, ImageGenerationSubmission,
         PublicAuthError, PublicAuthFailure, RequestLogContext,
@@ -716,10 +719,12 @@ pub async fn patch_admin_queue_config(
     }
     let image_task_timeout_seconds =
         body.image_task_timeout_seconds.unwrap_or(current.image_task_timeout_seconds);
-    if !(60..=7200).contains(&image_task_timeout_seconds) {
-        return Err(AppError::bad_request(
-            "image_task_timeout_seconds must be between 60 and 7200",
-        ));
+    if !(MIN_IMAGE_TASK_TIMEOUT_SECONDS..=MAX_IMAGE_TASK_TIMEOUT_SECONDS)
+        .contains(&image_task_timeout_seconds)
+    {
+        return Err(AppError::bad_request(format!(
+            "image_task_timeout_seconds must be between {MIN_IMAGE_TASK_TIMEOUT_SECONDS} and {MAX_IMAGE_TASK_TIMEOUT_SECONDS}",
+        )));
     }
     let config = service
         .storage()

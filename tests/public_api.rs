@@ -300,7 +300,7 @@ async fn compatible_image_generation_writes_api_session_history() {
     let (_temp, app, mock) = build_chat_test_app().await;
     mount_image_generation_mocks(&mock).await;
 
-    let response = app
+    let first_response = app
         .clone()
         .oneshot(
             Request::builder()
@@ -313,7 +313,22 @@ async fn compatible_image_generation_writes_api_session_history() {
         )
         .await
         .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let second_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-image-1","prompt":"draw a forest","n":1}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("second response");
+    assert_eq!(second_response.status(), StatusCode::OK);
 
     let sessions = app
         .oneshot(
@@ -329,7 +344,13 @@ async fn compatible_image_generation_writes_api_session_history() {
     assert_eq!(sessions.status(), StatusCode::OK);
     let bytes = to_bytes(sessions.into_body(), 1024 * 1024).await.expect("body");
     let value: Value = serde_json::from_slice(&bytes).expect("json");
-    assert!(value["items"].as_array().expect("items").iter().any(|item| item["source"] == "api"));
+    let api_session_count = value["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| item["source"] == "api")
+        .count();
+    assert_eq!(api_session_count, 2);
 }
 
 async fn mount_image_generation_mocks(mock: &MockServer) {

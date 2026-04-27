@@ -1433,6 +1433,24 @@ impl ControlDb {
         .await?
     }
 
+    /// Lists running image tasks whose worker runtime already exceeded the cutoff.
+    pub async fn list_running_image_tasks_started_at_or_before(
+        &self,
+        cutoff_started_at: i64,
+    ) -> Result<Vec<ImageTaskRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ImageTaskRecord>> {
+            let conn = Connection::open(path)?;
+            let sql = format!(
+                "SELECT {IMAGE_TASK_COLUMNS} FROM image_tasks WHERE status = 'running' AND started_at IS NOT NULL AND started_at <= ?1 ORDER BY started_at ASC, rowid ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([cutoff_started_at], image_task_from_row)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await?
+    }
+
     /// Lists image artifacts for one session in creation order.
     pub async fn list_artifacts_for_session(
         &self,

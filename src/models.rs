@@ -2,6 +2,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Minimum accepted runtime cap for one claimed image task.
+pub const MIN_IMAGE_TASK_TIMEOUT_SECONDS: i64 = 60;
+
+/// Maximum runtime cap for one claimed image task.
+pub const MAX_IMAGE_TASK_TIMEOUT_SECONDS: i64 = 180;
+
+/// Default runtime cap for one claimed image task.
+pub const DEFAULT_IMAGE_TASK_TIMEOUT_SECONDS: i64 = MAX_IMAGE_TASK_TIMEOUT_SECONDS;
+
+/// Returns the effective runtime cap for a persisted image-task timeout value.
+#[must_use]
+pub fn effective_image_task_timeout_seconds(value: i64) -> i64 {
+    value.clamp(1, MAX_IMAGE_TASK_TIMEOUT_SECONDS)
+}
+
 /// Supported sources for imported ChatGPT access credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AccountSourceKind {

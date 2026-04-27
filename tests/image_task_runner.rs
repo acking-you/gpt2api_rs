@@ -197,3 +197,103 @@ async fn startup_recovery_fails_interrupted_running_tasks_and_frees_queue_slot()
         storage.control.claim_next_image_task(1, 125).await.expect("claim next").expect("task");
     assert_eq!(next.id, second.id);
 }
+
+#[tokio::test]
+async fn runtime_timeout_recovery_fails_stale_running_tasks_and_frees_queue_slot() {
+    let temp = tempdir().expect("tempdir");
+    let paths = ResolvedPaths::new(temp.path().to_path_buf());
+    let storage = Storage::open(&paths).await.expect("storage opens");
+    let session = storage
+        .control
+        .create_session("key-a", "Image", SessionSource::Web)
+        .await
+        .expect("session");
+    let first_message = storage
+        .control
+        .append_message(
+            &session.id,
+            "key-a",
+            "assistant",
+            serde_json::json!({"blocks":[]}),
+            MessageStatus::Pending,
+        )
+        .await
+        .expect("first message");
+    let second_message = storage
+        .control
+        .append_message(
+            &session.id,
+            "key-a",
+            "assistant",
+            serde_json::json!({"blocks":[]}),
+            MessageStatus::Pending,
+        )
+        .await
+        .expect("second message");
+    let first = storage
+        .control
+        .create_image_task(CreateImageTaskInput {
+            session_id: &session.id,
+            message_id: &first_message.id,
+            key_id: "key-a",
+            mode: "generation",
+            prompt: "one",
+            model: "gpt-image-1",
+            n: 1,
+            request_json: serde_json::json!({}),
+        })
+        .await
+        .expect("first task");
+    let second = storage
+        .control
+        .create_image_task(CreateImageTaskInput {
+            session_id: &session.id,
+            message_id: &second_message.id,
+            key_id: "key-a",
+            mode: "generation",
+            prompt: "two",
+            model: "gpt-image-1",
+            n: 1,
+            request_json: serde_json::json!({}),
+        })
+        .await
+        .expect("second task");
+
+    let now = 1_000;
+    let claimed =
+        storage.control.claim_next_image_task(1, now - 181).await.expect("claim").expect("task");
+    assert_eq!(claimed.id, first.id);
+    assert!(
+        storage.control.claim_next_image_task(1, now).await.expect("blocked").is_none(),
+        "timed-out running task should consume the single queue slot before cleanup"
+    );
+
+    let service = AppService::new(
+        storage.clone(),
+        "admin-token".to_string(),
+        ChatgptUpstreamClient::default(),
+    )
+    .await
+    .expect("service");
+    assert_eq!(service.recover_timed_out_image_tasks(180, now).await.expect("recover"), 1);
+
+    let recovered = storage
+        .control
+        .get_image_task(&first.id)
+        .await
+        .expect("read recovered task")
+        .expect("recovered task exists");
+    assert_eq!(recovered.status, ImageTaskStatus::Failed);
+    assert_eq!(recovered.error_code.as_deref(), Some("image_task_timeout"));
+    assert!(recovered.error_message.as_deref().expect("timeout message").contains("180 seconds"));
+
+    let messages = storage.control.list_messages_for_session(&session.id).await.expect("messages");
+    let recovered_message =
+        messages.iter().find(|message| message.id == first_message.id).expect("recovered message");
+    assert_eq!(recovered_message.status, MessageStatus::Failed);
+    assert!(recovered_message.content_json.contains("timed out after 180 seconds"));
+
+    let next =
+        storage.control.claim_next_image_task(1, now + 1).await.expect("claim next").expect("task");
+    assert_eq!(next.id, second.id);
+}

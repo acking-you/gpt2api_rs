@@ -1,0 +1,4 @@
+[env]
+# Match StaticFlow's llm-access build path: use libduckdb-sys' non-bundled
+# downloader instead of compiling DuckDB C++ locally.
+DUCKDB_DOWNLOAD_LIB = { value = "1", force = false }
